@@ -1,0 +1,22 @@
+model:
+  weights: yolov8n.pt
+  device: cpu
+  imgsz: 640
+tracking:
+  conf: 0.25
+  iou: 0.45
+  max_det: 1000
+  tracker_config: configs/tracker/bytetrack.yaml
+roi:
+  path: data/rois/ec.json
+  enable: true
+events:
+  min_frames_in: 5
+  min_frames_out: 5
+render:
+  show_tracks: true
+  show_footpoints: true
+output:
+  dir: data/outputs
+  video_filename: ec_vis.mp4
+  csv_filename: ec.csv
