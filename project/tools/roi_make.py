@@ -205,13 +205,9 @@ def save_polygon(path: str, width: int, height: int, points: List[Point]) -> Non
         json.dump(payload, file, ensure_ascii=False, indent=2)
 
 
-def main() -> None:
-    """脚本主入口。"""
-    args = parse_args()
-    image = load_source_image(args.source)
+def _interactive_select(window_name: str, image: np.ndarray, out_path: str) -> bool:
+    """运行交互式 ROI 选择流程并保存结果。"""
     height, width = image.shape[:2]
-
-    window_name = "ROI Maker"
     selector = ROIPolygonSelector(window_name, image)
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -238,18 +234,35 @@ def main() -> None:
                 selector.set_message("存在越界点，保存失败")
                 continue
             try:
-                save_polygon(args.out, width, height, points)
+                save_polygon(out_path, width, height, points)
             except OSError as error:
                 selector.set_message(f"保存失败: {error}")
             else:
-                selector.set_message(f"保存成功: {args.out}")
+                selector.set_message(f"保存成功: {out_path}")
                 saved_once = True
         elif key == 27:  # ESC
             break
 
     cv2.destroyAllWindows()
-    if saved_once:
-        print(f"ROI 已保存至 {args.out}")
+    return saved_once
+
+
+def launch_roi_selector(source: str, out_path: str, window_name: str | None = None) -> bool:
+    """加载资源并启动交互式 ROI 标注。"""
+    image = load_source_image(source)
+    window = window_name or "ROI Maker"
+    saved = _interactive_select(window, image, out_path)
+    if saved:
+        print(f"ROI 已保存至 {out_path}")
+    return saved
+
+
+def main() -> None:
+    """脚本主入口。"""
+    args = parse_args()
+    saved = launch_roi_selector(args.source, args.out)
+    if not saved:
+        print("未保存 ROI，多边形标注未生效。")
 
 
 def _points_in_bounds(points: List[Point], width: int, height: int) -> bool:
