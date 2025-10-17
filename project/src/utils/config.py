@@ -26,6 +26,15 @@ def load_config(path: Path | str) -> Dict[str, Any]:
     return yaml_load(config_path)
 
 
+def save_config(path: Path | str, data: Dict[str, Any]) -> None:
+    """Persist configuration data back to disk."""
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to save configuration files.")
+    config_path = Path(path)
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    config_path.write_text(text, encoding="utf-8")
+
+
 def resolve_path(base: Path, value: str) -> Path:
     candidate = Path(value)
     if not candidate.is_absolute():

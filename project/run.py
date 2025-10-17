@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,7 +21,8 @@ from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.render.overlay import draw_overlays
 from src.roi.manager import ROIManager
-from src.utils.config import load_config, resolve_path
+from src.utils.config import load_config, resolve_path, save_config
+from src.plates import VehicleFilter
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -77,25 +79,52 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
     )
 
 
-def export_events(events, output_csv: Path, fps: float) -> None:
+def export_events(
+    events, output_csv: Path, fps: float, plate_metadata: Optional[List[Dict[str, object]]] = None
+) -> None:
     if not events:
         print("No occupancy events detected; skipping CSV export.")
         return
+    include_plate = plate_metadata is not None
     rows = []
     for event in events:
         start_time = event.start_frame / fps if fps else None
         end_time = event.end_frame / fps if fps else None
-        rows.append(
-            {
-                "track_id": event.track_id,
-                "start_frame": event.start_frame,
-                "end_frame": event.end_frame,
-                "duration_frames": event.duration_frames,
-                "start_time_s": start_time,
-                "end_time_s": end_time,
-            }
-        )
+        row: Dict[str, object] = {
+            "track_id": event.track_id,
+            "start_frame": event.start_frame,
+            "end_frame": event.end_frame,
+            "duration_frames": event.duration_frames,
+            "start_time_s": start_time,
+            "end_time_s": end_time,
+        }
+        if include_plate:
+            meta = {}
+            if plate_metadata and len(plate_metadata) > len(rows):
+                meta = plate_metadata[len(rows)]
+            row.update(
+                {
+                    "plate_img": meta.get("plate_img", ""),
+                    "plate_conf": meta.get("plate_conf"),
+                    "plate_score": meta.get("plate_score"),
+                    "plate_text": meta.get("plate_text"),
+                    "tail_img": meta.get("tail_img", ""),
+                    "plate_sharp_post": meta.get("plate_sharp_post"),
+                }
+            )
+        rows.append(row)
     df = pd.DataFrame(rows)
+    if include_plate:
+        for column in [
+            "plate_img",
+            "plate_conf",
+            "plate_score",
+            "plate_text",
+            "tail_img",
+            "plate_sharp_post",
+        ]:
+            if column not in df.columns:
+                df[column] = None
     df.to_csv(output_csv, index=False)
     print(f"Saved CSV to {output_csv}")
 
@@ -334,7 +363,10 @@ def _get_float_config(value: object, default: float) -> float:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(PROJECT_ROOT / args.config)
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = (PROJECT_ROOT / config_path).resolve()
+    config = load_config(config_path)
 
     source_path = resolve_path(PROJECT_ROOT, args.source)
     tracker_cfg_rel = config.get("tracking", {}).get("tracker_config", "configs/tracker/bytetrack.yaml")
@@ -345,37 +377,100 @@ def main() -> None:
         f"Video: {metadata.path.name} | FPS: {metadata.fps:.2f} | Frames: {metadata.frame_count} | Size: {metadata.frame_size}"
     )
 
-    roi_cfg = config.get("roi", {})
-    roi_candidates = []
+    roi_cfg = dict(config.get("roi", {}) or {})
+    roi_candidates: List[Path] = []
     roi_path: Optional[Path] = None
+
+    fallback_roi_path = resolve_path(PROJECT_ROOT, f"data/rois/{source_path.stem}.json")
+    roi_candidates.append(fallback_roi_path)
 
     if args.roi:
         roi_override = resolve_path(PROJECT_ROOT, str(args.roi))
         roi_candidates.append(roi_override)
-        if not roi_override.exists():
-            attempted = ", ".join(str(path) for path in roi_candidates)
-            raise FileNotFoundError(f"ROI override not found: {attempted}")
         roi_path = roi_override
     else:
         roi_path_value = roi_cfg.get("path")
         if isinstance(roi_path_value, (str, Path)) and str(roi_path_value).strip():
             config_roi_path = resolve_path(PROJECT_ROOT, str(roi_path_value))
             roi_candidates.append(config_roi_path)
-            if config_roi_path.exists():
-                roi_path = config_roi_path
+            roi_path = config_roi_path
 
-        fallback_roi_path = resolve_path(PROJECT_ROOT, f"data/rois/{source_path.stem}.json")
-        roi_candidates.append(fallback_roi_path)
-        if roi_path is None and fallback_roi_path.exists():
-            roi_path = fallback_roi_path
+    if roi_path is None:
+        roi_path = fallback_roi_path
 
-        if roi_path is None:
-            attempted = ", ".join(str(path) for path in roi_candidates)
-            raise FileNotFoundError(
-                "ROI file not found. Checked: "
-                f"{attempted}. Generate one with "
-                f"`python tools/roi_make.py --source {args.source} --out {fallback_roi_path}`."
-            )
+    if roi_path is None:
+        attempted = ", ".join(str(path) for path in roi_candidates)
+        raise FileNotFoundError(f"ROI path could not be resolved. Checked: {attempted}")
+
+    if not roi_path.exists():
+        # >>> 自动 ROI 生成
+        auto_mode = str(roi_cfg.get("mode", "")).lower()
+        if auto_mode == "auto_line":
+            auto_script = PROJECT_ROOT / "tools" / "roi_auto_line.py"
+            if auto_script.exists():
+                auto_cfg = dict(roi_cfg.get("auto_line", {}) or {})
+                cmd = [
+                    sys.executable,
+                    str(auto_script),
+                    "--source",
+                    str(source_path),
+                    "--out",
+                    str(roi_path),
+                ]
+                flag_map = {
+                    "sample_frames": "--sample-frames",
+                    "crop_right": "--crop-right",
+                    "crop_bottom": "--crop-bottom",
+                    "s_max": "--s-max",
+                    "v_min": "--v-min",
+                    "angle_min": "--angle-min",
+                    "angle_max": "--angle-max",
+                    "top_ratio": "--top-ratio",
+                    "bottom_margin": "--bottom-margin",
+                    "buffer": "--buffer",
+                }
+                for key, flag in flag_map.items():
+                    if key in auto_cfg and auto_cfg[key] is not None:
+                        cmd.extend([flag, str(auto_cfg[key])])
+                try:
+                    print("未找到 ROI 文件，正在执行自动白线检测生成...")
+                    subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
+                except subprocess.CalledProcessError as exc:
+                    print(f"自动白线检测失败（退出码 {exc.returncode}）：{exc}")
+                except Exception as exc:
+                    print(f"自动白线检测执行失败：{exc}")
+        # <<< 自动 ROI 生成
+        if not roi_path.exists():
+            try:
+                from tools.roi_make import launch_roi_selector
+
+                print("未找到 ROI 文件，正在启动交互式标注工具...")
+                created = launch_roi_selector(str(source_path), str(roi_path))
+            except Exception as exc:
+                raise RuntimeError(f"无法创建 ROI：{exc}") from exc
+            if not created or not roi_path.exists():
+                attempted = ", ".join(str(path) for path in roi_candidates)
+                raise RuntimeError(
+                    "ROI 标注未完成，无法继续运行。已尝试路径: " f"{attempted}"
+                )
+        try:
+            relative_path = roi_path.relative_to(PROJECT_ROOT)
+            roi_cfg["path"] = str(relative_path)
+        except ValueError:
+            roi_cfg["path"] = str(roi_path)
+        config["roi"] = roi_cfg
+        try:
+            save_config(config_path, config)
+            print(f"已更新配置文件 {config_path} 的 ROI 路径。")
+        except Exception as exc:
+            print(f"警告：无法写入配置文件更新 ROI 路径：{exc}")
+    else:
+        try:
+            relative_path = roi_path.relative_to(PROJECT_ROOT)
+            roi_cfg.setdefault("path", str(relative_path))
+        except ValueError:
+            roi_cfg.setdefault("path", str(roi_path))
+        config["roi"] = roi_cfg
 
     print(f"Using ROI file: {roi_path}")
     roi_manager = ROIManager(roi_path)
@@ -393,18 +488,84 @@ def main() -> None:
     output_cfg = config.get("output", {})
     output_dir = resolve_path(PROJECT_ROOT, output_cfg.get("dir", "data/outputs"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    video_stem = metadata.path.stem
+    video_output_dir = output_dir / video_stem
+    source_stem = Path(args.source).stem
+    # >>> 默认输出文件名（基于输入视频 stem）
+    if not output_cfg.get("video_filename"):
+        output_cfg["video_filename"] = f"{source_stem}.mp4"
+    if not output_cfg.get("csv_filename"):
+        output_cfg["csv_filename"] = f"{source_stem}.csv"
+    # <<< 默认输出文件名
 
     clip_pre_seconds = _get_float_config(output_cfg.get("clip_pre_seconds"), 1.0)
     clip_post_seconds = _get_float_config(output_cfg.get("clip_post_seconds"), 1.0)
     clip_subdir = str(output_cfg.get("clip_dir") or "clips")
-    plate_subdir = str(output_cfg.get("plate_dir") or "plates")
-    plate_padding = _get_float_config(output_cfg.get("plate_crop_padding"), 0.1)
-    plate_pre_seconds = _get_float_config(output_cfg.get("plate_pre_seconds"), 0.5)
-    plate_post_seconds = _get_float_config(output_cfg.get("plate_post_seconds"), 0.3)
+
+    plate_cfg = dict(config.get("plate", {}) or {})
+    plate_enabled = bool(args.plate or plate_cfg.get("enable", False))
+    plate_metadata: List[Dict[str, object]] = []
+    collector = None
+    plate_every_n_frames = 1
+    vehicle_filter = VehicleFilter(
+        plate_cfg.get("classes_allow"),
+        float(plate_cfg.get("bbox_aspect_min", 0.9)),
+        int(plate_cfg.get("min_box_h_px", 60)),
+    )
+    track_label_votes: Dict[int, Dict[str, Tuple[int, float]]] = {}
+
+    if plate_enabled:
+        from src.plates.detector_yolo import PlateDetector
+        from src.plates.collector import PlateCollector
+
+        plate_dirname = str(output_cfg.get("plate_dir") or "plates")
+        video_output_dir.mkdir(parents=True, exist_ok=True)
+        plates_out_dir = video_output_dir / plate_dirname
+        resolved_weights = resolve_path(
+            PROJECT_ROOT, str(plate_cfg.get("det_weights", "weights/plate/yolov8n-plate.pt"))
+        )
+        plate_cfg_resolved = dict(plate_cfg)
+        plate_cfg_resolved["det_weights"] = str(resolved_weights)
+        try:
+            detector = PlateDetector(
+                weights=plate_cfg_resolved["det_weights"],
+                device=str(plate_cfg_resolved.get("device", "cpu")),
+                imgsz=int(plate_cfg_resolved.get("imgsz", 320)),
+                conf=float(plate_cfg_resolved.get("conf", 0.25)),
+                iou=float(plate_cfg_resolved.get("iou", 0.45)),
+            )
+            collector = PlateCollector(plate_cfg_resolved, plates_out_dir, detector=detector)
+            plate_every_n_frames = max(getattr(collector, "every_n_frames", 1), 1)
+            if getattr(collector, "detector_available", False):
+                print(
+                    f"Plate detection enabled (weights: {plate_cfg_resolved['det_weights']}, device: {detector.device})."
+                )
+            else:
+                print(
+                    "Plate detector inactive; continuing with tail snapshot fallback only."
+                )
+        except Exception as exc:
+            print(f"Failed to initialize plate detection; continuing without it: {exc}")
+            collector = None
+            plate_enabled = False
+
+    if not plate_enabled:
+        print("Plate detection disabled.")
 
     tracker = prepare_tracker(config, tracker_cfg)
     video_writer = None
     fps = metadata.fps or 25.0
+    event_counter = 0
+
+    def _default_plate_meta() -> Dict[str, object]:
+        return {
+            "plate_img": "",
+            "plate_conf": None,
+            "plate_score": None,
+            "plate_text": "null",
+            "tail_img": "",
+            "plate_sharp_post": None,
+        }
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -424,33 +585,81 @@ def main() -> None:
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []
+            present_vote_ids: set[int] = set()
+            frame_height = frame.shape[0]
             if boxes is not None and boxes.id is not None:
                 ids = boxes.id
                 if hasattr(ids, "cpu"):
                     ids = ids.cpu().numpy()
-                ids = np.array(ids).flatten().tolist()
+                ids_list = np.array(ids).flatten().tolist()
 
                 coords = boxes.xyxy
                 if hasattr(coords, "cpu"):
                     coords = coords.cpu().numpy()
+                coords_list = np.array(coords).tolist()
+
                 confs = boxes.conf
                 if confs is not None and hasattr(confs, "cpu"):
                     confs = confs.cpu().numpy()
-
-                coords_list = np.array(coords).tolist()
                 conf_list = (
                     np.array(confs).flatten().tolist() if confs is not None else [None] * len(coords_list)
                 )
 
-                for track_id, bbox, conf in zip(ids, coords_list, conf_list):
+                cls_ids = getattr(boxes, "cls", None)
+                if cls_ids is not None and hasattr(cls_ids, "cpu"):
+                    cls_ids = cls_ids.cpu().numpy()
+                cls_list = (
+                    np.array(cls_ids).flatten().tolist() if cls_ids is not None else [None] * len(coords_list)
+                )
+
+                names_map = getattr(result, "names", None)
+
+                total = min(len(ids_list), len(coords_list))
+                for idx in range(total):
+                    track_id = ids_list[idx]
                     if track_id is None or (isinstance(track_id, float) and math.isnan(track_id)):
                         continue
+                    track_id_int = int(track_id)
+                    present_vote_ids.add(track_id_int)
+
+                    bbox = coords_list[idx]
+                    conf = conf_list[idx] if idx < len(conf_list) else None
+                    cls_id = cls_list[idx] if idx < len(cls_list) else None
+
+                    class_name = ""
+                    cls_index: Optional[int] = None
+                    if cls_id is not None and not (isinstance(cls_id, float) and math.isnan(cls_id)):
+                        try:
+                            cls_index = int(cls_id)
+                        except (TypeError, ValueError):
+                            cls_index = None
+                    if cls_index is not None:
+                        if isinstance(names_map, dict):
+                            class_name = str(names_map.get(cls_index, ""))
+                        elif isinstance(names_map, (list, tuple)):
+                            if 0 <= cls_index < len(names_map):
+                                class_name = str(names_map[cls_index])
+                        if not class_name:
+                            class_name = str(cls_index)
+                    class_name = class_name.lower() if class_name else ""
+
+                    votes = track_label_votes.setdefault(track_id_int, {})
+                    if class_name:
+                        prev_count, prev_conf = votes.get(class_name, (0, 0.0))
+                        conf_val = float(conf) if conf is not None else 0.0
+                        votes[class_name] = (prev_count + 1, max(prev_conf, conf_val))
+
                     x1, y1, x2, y2 = bbox
+                    width = max(float(x2) - float(x1), 0.0)
+                    height = max(float(y2) - float(y1), 0.0)
+                    if not vehicle_filter.is_vehicle(votes, (width, height), frame_height):
+                        continue
+
                     footpoint = ((x1 + x2) / 2.0, y2)
                     inside = roi_manager.point_in_roi(footpoint)
                     track_entries.append(
                         {
-                            "track_id": int(track_id),
+                            "track_id": track_id_int,
                             "bbox": [float(x1), float(y1), float(x2), float(y2)],
                             "footpoint": [float(footpoint[0]), float(footpoint[1])],
                             "inside": inside,
@@ -458,43 +667,93 @@ def main() -> None:
                         }
                     )
 
+            missing_vote_ids = set(track_label_votes.keys()) - present_vote_ids
+            for missing_id in list(missing_vote_ids):
+                track_label_votes.pop(missing_id, None)
+
+            if plate_enabled and collector is not None and frame_idx % plate_every_n_frames == 0:
+                for entry in track_entries:
+                    if not entry.get("inside"):
+                        continue
+                    bbox_entry = entry["bbox"]
+                    car_xyxy_full = [
+                        int(math.floor(bbox_entry[0])),
+                        int(math.floor(bbox_entry[1])),
+                        int(math.ceil(bbox_entry[2])),
+                        int(math.ceil(bbox_entry[3])),
+                    ]
+                    try:
+                        collector.update(
+                            track_id=int(entry["track_id"]),
+                            frame_idx=frame_idx,
+                            car_xyxy_full=car_xyxy_full,
+                            frame_bgr=frame,
+                        )
+                    except Exception as exc:
+                        print(f"Plate collector update failed for track {entry['track_id']}: {exc}")
+
             new_events = accumulator.update(frame_idx, track_entries)
             for event in new_events:
                 duration = event.duration_frames
                 print(
                     f"Completed event: track {event.track_id} | frames {event.start_frame}-{event.end_frame} | duration {duration}"
                 )
+                event_counter += 1
+                if plate_enabled:
+                    meta = _default_plate_meta()
+                    if collector is not None:
+                        try:
+                            meta = collector.finalize_and_save(
+                                event_counter, event.track_id, start_frame=event.start_frame
+                            )
+                        except Exception as exc:
+                            print(f"Plate finalize failed for track {event.track_id}: {exc}")
+                        finally:
+                            try:
+                                collector.clear(event_counter, event.track_id)
+                            except Exception as clear_exc:
+                                print(
+                                    f"Failed to clear plate collector for track {event.track_id}: {clear_exc}"
+                                )
+                    plate_metadata.append(meta)
 
             annotated = frame.copy()
             draw_overlays(annotated, roi_manager.polygon, track_entries, show_tracks, show_footpoints)
             if args.save_video and video_writer is not None:
                 video_writer.write(annotated)
 
-        accumulator.flush()
-
     finally:
         if video_writer is not None:
             video_writer.release()
 
+    remaining_events = accumulator.flush()
+    for event in remaining_events:
+        event_counter += 1
+        if plate_enabled:
+            meta = _default_plate_meta()
+            if collector is not None:
+                try:
+                    meta = collector.finalize_and_save(
+                        event_counter, event.track_id, start_frame=event.start_frame
+                    )
+                except Exception as exc:
+                    print(f"Plate finalize failed for track {event.track_id}: {exc}")
+                finally:
+                    try:
+                        collector.clear(event_counter, event.track_id)
+                    except Exception as clear_exc:
+                        print(
+                            f"Failed to clear plate collector for track {event.track_id}: {clear_exc}"
+                        )
+            plate_metadata.append(meta)
+
     events = list(accumulator.completed)
     if args.save_csv:
         csv_path = output_dir / output_cfg.get("csv_filename", "occupancy.csv")
-        export_events(events, csv_path, fps)
+        export_events(events, csv_path, fps, plate_metadata if plate_enabled else None)
 
     if args.clip:
         export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
-
-    if args.plate:
-        export_plate_crops(
-            events,
-            metadata,
-            output_dir,
-            fps,
-            plate_padding,
-            plate_subdir,
-            plate_pre_seconds,
-            plate_post_seconds,
-        )
 
 
 if __name__ == "__main__":
