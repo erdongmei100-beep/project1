@@ -1,0 +1,4 @@
+﻿.venv/
+**/__pycache__/
+*.py[cod]
+project/data/outputs/
