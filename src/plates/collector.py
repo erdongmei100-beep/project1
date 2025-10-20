@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from src.utils.paths import PROJECT_ROOT, resolve_plate_weights
+
 from .detector_yolo import PlateDetector
 from .preprocess import enhance_plate
 from .quality import (
@@ -109,7 +111,13 @@ class PlateCollector:
         self.pick_mode = str(self.cfg.get("pick_mode", "full")).lower()
         self.entry_window_frames = max(int(self.cfg.get("entry_window_frames", 0)), 0)
 
-        weights_path = Path(str(self.cfg.get("det_weights", "weights/plate/yolov8n-plate.pt")))
+        det_weights_value = self.cfg.get("det_weights")
+        if det_weights_value is None:
+            weights_path = resolve_plate_weights()
+        else:
+            weights_path = Path(str(det_weights_value))
+            if not weights_path.is_absolute():
+                weights_path = PROJECT_ROOT / weights_path
         device = str(self.cfg.get("device", "cpu"))
         imgsz = int(self.cfg.get("imgsz", 320))
         conf = float(self.cfg.get("conf", 0.25))

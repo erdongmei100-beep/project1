@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,17 +13,27 @@ import cv2
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
-
 from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.render.overlay import draw_overlays
 from src.roi.manager import ROIManager
 from src.utils.config import load_config, resolve_path, save_config
+from src.utils.paths import (
+    CONFIGS_DIR,
+    DATA_DIR,
+    OUTPUTS_DIR,
+    PROJECT_ROOT,
+    project_path,
+    resolve_project_path,
+)
 from src.plates import VehicleFilter
+from src.utils.weights import ensure_plate_weights
+
+
+DEFAULT_CONFIG_REL = project_path("configs", "default.yaml").relative_to(PROJECT_ROOT)
+DEFAULT_TRACKER_CFG_REL = project_path("configs", "tracker", "bytetrack.yaml").relative_to(PROJECT_ROOT)
+DEFAULT_ROIS_DIR = project_path("data", "rois")
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -30,7 +41,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--source", required=True, help="Path to input video")
     parser.add_argument(
         "--config",
-        default="configs/default.yaml",
+        default=str(DEFAULT_CONFIG_REL),
         help="Path to YAML configuration file",
     )
     parser.add_argument(
@@ -57,6 +68,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--plate",
         action="store_true",
         help="Export per-event plate crops (best frame snapshot).",
+    )
+    parser.add_argument(
+        "--weights-plate",
+        default=None,
+        help="Optional override for plate detector weights path.",
     )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
@@ -369,8 +385,12 @@ def main() -> None:
     config = load_config(config_path)
 
     source_path = resolve_path(PROJECT_ROOT, args.source)
-    tracker_cfg_rel = config.get("tracking", {}).get("tracker_config", "configs/tracker/bytetrack.yaml")
+    tracking_cfg = dict(config.get("tracking", {}) or {})
+    tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
     tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
+
+    data_cfg = dict(config.get("data", {}) or {})
+    weights_cfg = dict(config.get("weights", {}) or {})
 
     metadata = probe_video(source_path)
     print(
@@ -381,7 +401,8 @@ def main() -> None:
     roi_candidates: List[Path] = []
     roi_path: Optional[Path] = None
 
-    fallback_roi_path = resolve_path(PROJECT_ROOT, f"data/rois/{source_path.stem}.json")
+    rois_dir = resolve_project_path(data_cfg.get("rois_dir"), DEFAULT_ROIS_DIR)
+    fallback_roi_path = rois_dir / f"{source_path.stem}.json"
     roi_candidates.append(fallback_roi_path)
 
     if args.roi:
@@ -485,22 +506,20 @@ def main() -> None:
     show_tracks = bool(render_cfg.get("show_tracks", True))
     show_footpoints = bool(render_cfg.get("show_footpoints", True))
 
-    output_cfg = config.get("output", {})
-    output_dir = resolve_path(PROJECT_ROOT, output_cfg.get("dir", "data/outputs"))
+    outputs_cfg = dict(config.get("outputs") or config.get("output") or {})
+    output_dir = resolve_project_path(outputs_cfg.get("root") or outputs_cfg.get("dir"), OUTPUTS_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
-    video_stem = metadata.path.stem
-    video_output_dir = output_dir / video_stem
-    source_stem = Path(args.source).stem
+    source_stem = metadata.path.stem
     # >>> 默认输出文件名（基于输入视频 stem）
-    if not output_cfg.get("video_filename"):
-        output_cfg["video_filename"] = f"{source_stem}.mp4"
-    if not output_cfg.get("csv_filename"):
-        output_cfg["csv_filename"] = f"{source_stem}.csv"
+    if not outputs_cfg.get("video_filename"):
+        outputs_cfg["video_filename"] = f"{source_stem}.mp4"
+    if not outputs_cfg.get("csv_filename"):
+        outputs_cfg["csv_filename"] = f"{source_stem}.csv"
     # <<< 默认输出文件名
 
-    clip_pre_seconds = _get_float_config(output_cfg.get("clip_pre_seconds"), 1.0)
-    clip_post_seconds = _get_float_config(output_cfg.get("clip_post_seconds"), 1.0)
-    clip_subdir = str(output_cfg.get("clip_dir") or "clips")
+    clip_pre_seconds = _get_float_config(outputs_cfg.get("clip_pre_seconds"), 1.0)
+    clip_post_seconds = _get_float_config(outputs_cfg.get("clip_post_seconds"), 1.0)
+    clip_subdir = str(outputs_cfg.get("clip_dir") or "clips")
 
     plate_cfg = dict(config.get("plate", {}) or {})
     plate_enabled = bool(args.plate or plate_cfg.get("enable", False))
@@ -518,14 +537,22 @@ def main() -> None:
         from src.plates.detector_yolo import PlateDetector
         from src.plates.collector import PlateCollector
 
-        plate_dirname = str(output_cfg.get("plate_dir") or "plates")
-        video_output_dir.mkdir(parents=True, exist_ok=True)
-        plates_out_dir = video_output_dir / plate_dirname
-        resolved_weights = resolve_path(
-            PROJECT_ROOT, str(plate_cfg.get("det_weights", "weights/plate/yolov8n-plate.pt"))
+        plate_dirname = str(outputs_cfg.get("plate_dir") or "plates")
+        plates_out_dir = output_dir / plate_dirname
+        plates_out_dir.mkdir(parents=True, exist_ok=True)
+
+        configured_weight = plate_cfg.get("det_weights") or weights_cfg.get("plate")
+        env_plate_value = os.getenv("PLATE_WEIGHTS") or None
+        configured_value = str(configured_weight) if configured_weight else None
+        plate_weights_path = ensure_plate_weights(
+            args.weights_plate,
+            env_plate_value,
+            configured_value,
         )
+
         plate_cfg_resolved = dict(plate_cfg)
-        plate_cfg_resolved["det_weights"] = str(resolved_weights)
+
+        plate_cfg_resolved["det_weights"] = str(plate_weights_path)
         try:
             detector = PlateDetector(
                 weights=plate_cfg_resolved["det_weights"],
@@ -577,7 +604,7 @@ def main() -> None:
                 if args.save_video:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(
-                        str(output_dir / output_cfg.get("video_filename", "occupancy.mp4")),
+                        str(output_dir / outputs_cfg.get("video_filename", "occupancy.mp4")),
                         fourcc,
                         fps,
                         (frame.shape[1], frame.shape[0]),
@@ -749,7 +776,7 @@ def main() -> None:
 
     events = list(accumulator.completed)
     if args.save_csv:
-        csv_path = output_dir / output_cfg.get("csv_filename", "occupancy.csv")
+        csv_path = output_dir / outputs_cfg.get("csv_filename", "occupancy.csv")
         export_events(events, csv_path, fps, plate_metadata if plate_enabled else None)
 
     if args.clip:
