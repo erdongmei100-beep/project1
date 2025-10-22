@@ -9,7 +9,9 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .detector_yolo import PlateDetector
+from src.utils.paths import OUTPUTS_DIR, WEIGHTS_DIR
+
+from .detector import PlateDetector
 from .preprocess import enhance_plate
 from .quality import (
     angle_penalty,
@@ -90,9 +92,14 @@ class PlateCandidate:
 class PlateCollector:
     """Maintain plate detection candidates per track/event."""
 
-    def __init__(self, cfg_plate: dict, out_dir: Path, detector: Optional[PlateDetector] = None) -> None:
+    def __init__(
+        self,
+        cfg_plate: dict,
+        out_dir: Path | None,
+        detector: Optional[PlateDetector] = None,
+    ) -> None:
         self.cfg = dict(cfg_plate or {})
-        self.out_dir = Path(out_dir)
+        self.out_dir = Path(out_dir) if out_dir else OUTPUTS_DIR / "plates"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.debug_dir = self.out_dir / "debug"
         self.save_debug = bool(self.cfg.get("save_debug", False))
@@ -109,7 +116,9 @@ class PlateCollector:
         self.pick_mode = str(self.cfg.get("pick_mode", "full")).lower()
         self.entry_window_frames = max(int(self.cfg.get("entry_window_frames", 0)), 0)
 
-        weights_path = Path(str(self.cfg.get("det_weights", "weights/plate/yolov8n-plate.pt")))
+        det_weights_default = WEIGHTS_DIR / "plate" / "yolov8n-plate.pt"
+        weights_cfg = self.cfg.get("det_weights")
+        weights_path = Path(str(weights_cfg)) if weights_cfg else det_weights_default
         device = str(self.cfg.get("device", "cpu"))
         imgsz = int(self.cfg.get("imgsz", 320))
         conf = float(self.cfg.get("conf", 0.25))

@@ -1,42 +1,72 @@
-"""Emergency lane occupancy detection MVP runner."""
+"""Emergency lane occupancy detection runner."""
 from __future__ import annotations
 
 import argparse
 import math
-import subprocess
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import cv2
-import numpy as np
-import pandas as pd
+try:  # pragma: no cover - dependency availability is runtime specific
+    import cv2
+except ImportError as exc:  # pragma: no cover - fail fast with guidance
+    raise SystemExit(
+        "OpenCV (cv2) 未安装。请先运行 setup_env 脚本或执行 pip install -r requirements.txt。"
+    ) from exc
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
+try:  # pragma: no cover
+    import numpy as np
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "NumPy 未安装。请先运行 setup_env 脚本或执行 pip install -r requirements.txt。"
+    ) from exc
+
+try:  # pragma: no cover
+    import pandas as pd
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "Pandas 未安装。请先运行 setup_env 脚本或执行 pip install -r requirements.txt。"
+    ) from exc
 
 from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.render.overlay import draw_overlays
 from src.roi.manager import ROIManager
-from src.utils.config import load_config, resolve_path, save_config
+from src.utils.config import load_config, resolve_path
+from src.utils.paths import CONFIGS_DIR, OUTPUTS_DIR, ROOT, WEIGHTS_DIR
 from src.plates import VehicleFilter
 
 
+PLATE_WEIGHTS_FILENAME = "yolov8n-plate.pt"
+PLATE_WEIGHTS_URL = (
+    "https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8n.pt"
+)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Emergency lane occupancy detection MVP")
-    parser.add_argument("--source", required=True, help="Path to input video")
+    parser = argparse.ArgumentParser(
+        description="Emergency lane occupancy detection pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--source",
+        required=True,
+        help="Path to input video relative to the repository root (e.g. data/videos/ambulance.mp4)",
+    )
+    parser.add_argument(
+        "--roi",
+        required=True,
+        help="Path to ROI JSON relative to the repository root (e.g. data/rois/ambulance.json)",
+    )
     parser.add_argument(
         "--config",
-        default="configs/default.yaml",
-        help="Path to YAML configuration file",
+        default=str(CONFIGS_DIR / "default.yaml"),
+        help="Path to YAML configuration file relative to the repository root",
     )
     parser.add_argument(
         "--save-video",
         action="store_true",
-        help="Save annotated video to outputs directory",
+        help="Save annotated video to the outputs directory",
     )
     parser.add_argument(
         "--save-csv",
@@ -44,25 +74,83 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Save occupancy events as CSV",
     )
     parser.add_argument(
-        "--roi",
-        default=None,
-        help="Optional ROI JSON file that overrides configuration and automatic lookup.",
-    )
-    parser.add_argument(
         "--clip",
         action="store_true",
-        help="Export per-event video clips with buffered context.",
+        help="Export per-event video clips with buffered context",
     )
     parser.add_argument(
         "--plate",
         action="store_true",
-        help="Export per-event plate crops (best frame snapshot).",
+        help="Export per-event plate crops (best frame snapshot)",
     )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         joined = " ".join(unknown)
         print(f"Warning: Ignoring unknown arguments: {joined}")
     return args
+
+
+def ensure_plate_weights(config_value: Optional[str]) -> Path:
+    """Ensure the plate detector weights exist, downloading when necessary."""
+
+    if config_value:
+        candidate = Path(str(config_value))
+        if not candidate.is_absolute():
+            candidate = (ROOT / candidate).resolve()
+    else:
+        candidate = WEIGHTS_DIR / "plate" / PLATE_WEIGHTS_FILENAME
+
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+
+    if candidate.exists():
+        return candidate
+
+    print(
+        "车牌检测权重缺失。请先执行: git lfs install && git lfs pull"
+    )
+
+    if not PLATE_WEIGHTS_URL:
+        raise FileNotFoundError(
+            f"Plate weights not found at {candidate}. 请参考 README 手动下载。"
+        )
+
+    try:
+        import requests  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise FileNotFoundError(
+            "无法自动下载车牌权重 (requests 未安装)。"
+            "请先运行 setup_env 脚本或执行 pip install -r requirements.txt，然后手动下载。"
+        ) from exc
+
+    print(f"尝试从镜像下载权重: {PLATE_WEIGHTS_URL}")
+
+    try:
+        with requests.get(PLATE_WEIGHTS_URL, stream=True, timeout=30) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            with candidate.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        percent = downloaded / total * 100
+                        print(f"下载进度: {percent:5.1f}%", end="\r", flush=True)
+            if total:
+                print(" " * 40, end="\r")
+    except Exception as exc:
+        if candidate.exists():
+            candidate.unlink(missing_ok=True)
+        raise RuntimeError(f"无法下载车牌权重: {exc}") from exc
+
+    if candidate.stat().st_size == 0:
+        candidate.unlink(missing_ok=True)
+        raise RuntimeError("下载的权重文件大小为 0，已删除。请检查镜像地址。")
+
+    print(f"已下载车牌权重到: {candidate}")
+    return candidate
 
 
 def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> DetectorTracker:
@@ -365,114 +453,29 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config)
     if not config_path.is_absolute():
-        config_path = (PROJECT_ROOT / config_path).resolve()
+        config_path = (ROOT / config_path).resolve()
     config = load_config(config_path)
 
-    source_path = resolve_path(PROJECT_ROOT, args.source)
-    tracker_cfg_rel = config.get("tracking", {}).get("tracker_config", "configs/tracker/bytetrack.yaml")
-    tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
+    source_path = resolve_path(ROOT, args.source)
+    roi_path = resolve_path(ROOT, args.roi)
+    tracker_cfg_rel = config.get(
+        "tracking", {}
+    ).get("tracker_config", "configs/tracker/bytetrack.yaml")
+    tracker_cfg = resolve_path(ROOT, tracker_cfg_rel)
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"Source video not found: {source_path}")
+    if not roi_path.exists():
+        raise FileNotFoundError(f"ROI 文件不存在: {roi_path}")
+    if not tracker_cfg.exists():
+        raise FileNotFoundError(f"Tracker config not found: {tracker_cfg}")
 
     metadata = probe_video(source_path)
     print(
         f"Video: {metadata.path.name} | FPS: {metadata.fps:.2f} | Frames: {metadata.frame_count} | Size: {metadata.frame_size}"
     )
-
-    roi_cfg = dict(config.get("roi", {}) or {})
-    roi_candidates: List[Path] = []
-    roi_path: Optional[Path] = None
-
-    fallback_roi_path = resolve_path(PROJECT_ROOT, f"data/rois/{source_path.stem}.json")
-    roi_candidates.append(fallback_roi_path)
-
-    if args.roi:
-        roi_override = resolve_path(PROJECT_ROOT, str(args.roi))
-        roi_candidates.append(roi_override)
-        roi_path = roi_override
-    else:
-        roi_path_value = roi_cfg.get("path")
-        if isinstance(roi_path_value, (str, Path)) and str(roi_path_value).strip():
-            config_roi_path = resolve_path(PROJECT_ROOT, str(roi_path_value))
-            roi_candidates.append(config_roi_path)
-            roi_path = config_roi_path
-
-    if roi_path is None:
-        roi_path = fallback_roi_path
-
-    if roi_path is None:
-        attempted = ", ".join(str(path) for path in roi_candidates)
-        raise FileNotFoundError(f"ROI path could not be resolved. Checked: {attempted}")
-
-    if not roi_path.exists():
-        # >>> 自动 ROI 生成
-        auto_mode = str(roi_cfg.get("mode", "")).lower()
-        if auto_mode == "auto_line":
-            auto_script = PROJECT_ROOT / "tools" / "roi_auto_line.py"
-            if auto_script.exists():
-                auto_cfg = dict(roi_cfg.get("auto_line", {}) or {})
-                cmd = [
-                    sys.executable,
-                    str(auto_script),
-                    "--source",
-                    str(source_path),
-                    "--out",
-                    str(roi_path),
-                ]
-                flag_map = {
-                    "sample_frames": "--sample-frames",
-                    "crop_right": "--crop-right",
-                    "crop_bottom": "--crop-bottom",
-                    "s_max": "--s-max",
-                    "v_min": "--v-min",
-                    "angle_min": "--angle-min",
-                    "angle_max": "--angle-max",
-                    "top_ratio": "--top-ratio",
-                    "bottom_margin": "--bottom-margin",
-                    "buffer": "--buffer",
-                }
-                for key, flag in flag_map.items():
-                    if key in auto_cfg and auto_cfg[key] is not None:
-                        cmd.extend([flag, str(auto_cfg[key])])
-                try:
-                    print("未找到 ROI 文件，正在执行自动白线检测生成...")
-                    subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
-                except subprocess.CalledProcessError as exc:
-                    print(f"自动白线检测失败（退出码 {exc.returncode}）：{exc}")
-                except Exception as exc:
-                    print(f"自动白线检测执行失败：{exc}")
-        # <<< 自动 ROI 生成
-        if not roi_path.exists():
-            try:
-                from tools.roi_make import launch_roi_selector
-
-                print("未找到 ROI 文件，正在启动交互式标注工具...")
-                created = launch_roi_selector(str(source_path), str(roi_path))
-            except Exception as exc:
-                raise RuntimeError(f"无法创建 ROI：{exc}") from exc
-            if not created or not roi_path.exists():
-                attempted = ", ".join(str(path) for path in roi_candidates)
-                raise RuntimeError(
-                    "ROI 标注未完成，无法继续运行。已尝试路径: " f"{attempted}"
-                )
-        try:
-            relative_path = roi_path.relative_to(PROJECT_ROOT)
-            roi_cfg["path"] = str(relative_path)
-        except ValueError:
-            roi_cfg["path"] = str(roi_path)
-        config["roi"] = roi_cfg
-        try:
-            save_config(config_path, config)
-            print(f"已更新配置文件 {config_path} 的 ROI 路径。")
-        except Exception as exc:
-            print(f"警告：无法写入配置文件更新 ROI 路径：{exc}")
-    else:
-        try:
-            relative_path = roi_path.relative_to(PROJECT_ROOT)
-            roi_cfg.setdefault("path", str(relative_path))
-        except ValueError:
-            roi_cfg.setdefault("path", str(roi_path))
-        config["roi"] = roi_cfg
-
     print(f"Using ROI file: {roi_path}")
+
     roi_manager = ROIManager(roi_path)
 
     events_cfg = config.get("events", {})
@@ -485,28 +488,27 @@ def main() -> None:
     show_tracks = bool(render_cfg.get("show_tracks", True))
     show_footpoints = bool(render_cfg.get("show_footpoints", True))
 
-    output_cfg = config.get("output", {})
-    output_dir = resolve_path(PROJECT_ROOT, output_cfg.get("dir", "data/outputs"))
+    output_cfg = dict(config.get("output", {}) or {})
+    default_output_rel = str(OUTPUTS_DIR.relative_to(ROOT))
+    output_dir = resolve_path(ROOT, output_cfg.get("dir", default_output_rel))
     output_dir.mkdir(parents=True, exist_ok=True)
-    video_stem = metadata.path.stem
-    video_output_dir = output_dir / video_stem
+    video_output_dir = output_dir / source_path.stem
+    video_output_dir.mkdir(parents=True, exist_ok=True)
     source_stem = Path(args.source).stem
-    # >>> 默认输出文件名（基于输入视频 stem）
-    if not output_cfg.get("video_filename"):
-        output_cfg["video_filename"] = f"{source_stem}.mp4"
-    if not output_cfg.get("csv_filename"):
-        output_cfg["csv_filename"] = f"{source_stem}.csv"
-    # <<< 默认输出文件名
+    output_cfg.setdefault("video_filename", f"{source_stem}.mp4")
+    output_cfg.setdefault("csv_filename", f"{source_stem}.csv")
 
     clip_pre_seconds = _get_float_config(output_cfg.get("clip_pre_seconds"), 1.0)
     clip_post_seconds = _get_float_config(output_cfg.get("clip_post_seconds"), 1.0)
     clip_subdir = str(output_cfg.get("clip_dir") or "clips")
 
+    print(f"Output base directory: {video_output_dir}")
+
     plate_cfg = dict(config.get("plate", {}) or {})
     plate_enabled = bool(args.plate or plate_cfg.get("enable", False))
     plate_metadata: List[Dict[str, object]] = []
     collector = None
-    plate_every_n_frames = 1
+    plate_every_n_frames = max(int(plate_cfg.get("every_n_frames", 1)), 1)
     vehicle_filter = VehicleFilter(
         plate_cfg.get("classes_allow"),
         float(plate_cfg.get("bbox_aspect_min", 0.9)),
@@ -515,17 +517,14 @@ def main() -> None:
     track_label_votes: Dict[int, Dict[str, Tuple[int, float]]] = {}
 
     if plate_enabled:
-        from src.plates.detector_yolo import PlateDetector
         from src.plates.collector import PlateCollector
+        from src.plates.detector import PlateDetector
 
         plate_dirname = str(output_cfg.get("plate_dir") or "plates")
-        video_output_dir.mkdir(parents=True, exist_ok=True)
         plates_out_dir = video_output_dir / plate_dirname
-        resolved_weights = resolve_path(
-            PROJECT_ROOT, str(plate_cfg.get("det_weights", "weights/plate/yolov8n-plate.pt"))
-        )
+        weights_path = ensure_plate_weights(str(plate_cfg.get("det_weights")))
         plate_cfg_resolved = dict(plate_cfg)
-        plate_cfg_resolved["det_weights"] = str(resolved_weights)
+        plate_cfg_resolved["det_weights"] = str(weights_path)
         try:
             detector = PlateDetector(
                 weights=plate_cfg_resolved["det_weights"],
@@ -535,15 +534,13 @@ def main() -> None:
                 iou=float(plate_cfg_resolved.get("iou", 0.45)),
             )
             collector = PlateCollector(plate_cfg_resolved, plates_out_dir, detector=detector)
-            plate_every_n_frames = max(getattr(collector, "every_n_frames", 1), 1)
+            plate_every_n_frames = max(getattr(collector, "every_n_frames", plate_every_n_frames), 1)
             if getattr(collector, "detector_available", False):
                 print(
                     f"Plate detection enabled (weights: {plate_cfg_resolved['det_weights']}, device: {detector.device})."
                 )
             else:
-                print(
-                    "Plate detector inactive; continuing with tail snapshot fallback only."
-                )
+                print("Plate detector inactive; continuing with tail snapshot fallback only.")
         except Exception as exc:
             print(f"Failed to initialize plate detection; continuing without it: {exc}")
             collector = None
@@ -576,12 +573,19 @@ def main() -> None:
                 roi_manager.ensure_ready((frame.shape[1], frame.shape[0]))
                 if args.save_video:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_path = video_output_dir / output_cfg.get(
+                        "video_filename", "occupancy.mp4"
+                    )
                     video_writer = cv2.VideoWriter(
-                        str(output_dir / output_cfg.get("video_filename", "occupancy.mp4")),
+                        str(video_path),
                         fourcc,
                         fps,
                         (frame.shape[1], frame.shape[0]),
                     )
+                    if video_writer is not None and video_writer.isOpened():
+                        print(f"Saving annotated video to {video_path}")
+                    else:
+                        print(f"Failed to open video writer at {video_path}")
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []
@@ -749,11 +753,19 @@ def main() -> None:
 
     events = list(accumulator.completed)
     if args.save_csv:
-        csv_path = output_dir / output_cfg.get("csv_filename", "occupancy.csv")
+        csv_path = video_output_dir / output_cfg.get("csv_filename", "occupancy.csv")
         export_events(events, csv_path, fps, plate_metadata if plate_enabled else None)
 
     if args.clip:
-        export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
+        export_event_clips(
+            events,
+            metadata,
+            video_output_dir,
+            fps,
+            clip_pre_seconds,
+            clip_post_seconds,
+            clip_subdir,
+        )
 
 
 if __name__ == "__main__":

@@ -1,10 +1,5 @@
 import sys
-from pathlib import Path
 import unittest
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
 
 from src.utils.geometry import point_in_polygon
 

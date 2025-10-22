@@ -8,20 +8,9 @@ tracking:
   max_det: 1000
   tracker_config: configs/tracker/bytetrack.yaml
 roi:
-  path: data\rois\ec.json
+  path: data/rois/ambulance.json
   enable: true
   mode: manual
-  auto_line:
-    sample_frames: 15
-    crop_right: 0.45
-    crop_bottom: 0.7
-    s_max: 60
-    v_min: 200
-    angle_min: 15
-    angle_max: 75
-    top_ratio: 0.35
-    bottom_margin: 20
-    buffer: 6
 events:
   min_frames_in: 5
   min_frames_out: 5
@@ -30,8 +19,8 @@ render:
   show_footpoints: true
 output:
   dir: data/outputs
-  video_filename: ec_vis.mp4
-  csv_filename: ec.csv
+  clip_dir: clips
+  plate_dir: plates
 plate:
   enable: true
   det_weights: weights/plate/yolov8n-plate.pt
