@@ -1,4 +1,4 @@
-﻿.venv/
-**/__pycache__/
+.venv*/
+data/outputs/
+__pycache__/
 *.py[cod]
-project/data/outputs/
