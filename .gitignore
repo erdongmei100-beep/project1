@@ -1,4 +1,11 @@
-﻿.venv/
-**/__pycache__/
+.venv/
 *.py[cod]
-project/data/outputs/
+**/__pycache__/
+logs/
+data/outputs/
+!data/outputs
+!data/outputs/.gitkeep
+!data/outputs/clips/.gitkeep
+!data/outputs/plates/.gitkeep
+!data/outputs/auto_cv/
+!data/outputs/auto_cv/**

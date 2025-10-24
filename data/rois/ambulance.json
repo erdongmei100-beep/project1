@@ -24,5 +24,21 @@
       3080,
       2017
     ]
-  ]
+  ],
+  "meta": {
+    "mode": "auto_cv",
+    "metrics": {
+      "rel_area": 0.09125295380015432,
+      "roi_height": 872,
+      "roi_aspect": 2.0458715596330275,
+      "sharpness": 85.0,
+      "overlay_path": "data/outputs/auto_cv/ambulance_overlay.png"
+    },
+    "params": {
+      "min_box_h_px": 30,
+      "min_rel_area": 0.003,
+      "min_sharpness": 60.0,
+      "bbox_aspect_min": 0.6
+    }
+  }
 }

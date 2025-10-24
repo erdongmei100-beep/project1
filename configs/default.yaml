@@ -8,20 +8,30 @@ tracking:
   max_det: 1000
   tracker_config: configs/tracker/bytetrack.yaml
 roi:
-  path: data\rois\ec.json
-  enable: true
-  mode: manual
-  auto_line:
-    sample_frames: 15
-    crop_right: 0.45
-    crop_bottom: 0.7
-    s_max: 60
-    v_min: 200
-    angle_min: 15
-    angle_max: 75
-    top_ratio: 0.35
-    bottom_margin: 20
-    buffer: 6
+  enable: true  # 是否启用 ROI 裁剪逻辑
+  mode: auto_cv  # manual=使用已有 JSON，auto_cv=根据视频自动估计
+  path: ""  # 留空则默认写入 data/rois/<视频名>.json，可指定固定输出
+  auto_cv:
+    sample_frames: 18        # 自动 ROI 检测时抽样的帧数
+    crop_right: 0.45         # 右侧裁剪比例，聚焦车道线区域
+    crop_bottom: 0.70        # 底部裁剪比例，过滤远处噪声
+    s_max: 70                # HSV 饱和度上限，突出白色标线
+    v_min: 190               # HSV 亮度下限，排除暗噪声
+    angle_min: 18.0          # 允许的车道线最小角度（度）
+    angle_max: 78.0          # 允许的车道线最大角度（度）
+    top_ratio: 0.33          # ROI 顶部相对于图像高度的比例
+    bottom_margin: 18        # ROI 底部的安全边距（像素）
+    buffer: 6                # 沿检测到的车道线向内偏移的像素
+    min_box_h_px: 30         # ROI 多边形的最小高度（像素）
+    min_rel_area: 0.003      # ROI 面积占整帧的最小比例
+    min_sharpness: 60.0      # ROI 内部的最小清晰度（拉普拉斯方差）
+    bbox_aspect_min: 0.6     # ROI 多边形宽高比的最小值
+    only_with_plate: false   # 若为 true 需要清晰度达标才视为成功
+    allow_tail_fallback: true  # 失败时是否允许保留上一轮 ROI
+    save_debug: true         # 保存自动 ROI 可视化叠加图
+    track_min_frames: 6      # 预留：用于调参报告记录的跟踪帧阈值
+    entry_window_frames: 12  # 预留：调参脚本可使用的窗口大小
+    per_track: true          # 预留：调参脚本是否逐轨迹记录
 events:
   min_frames_in: 5
   min_frames_out: 5
@@ -30,8 +40,8 @@ render:
   show_footpoints: true
 output:
   dir: data/outputs
-  video_filename: ec_vis.mp4
-  csv_filename: ec.csv
+  clip_dir: clips
+  plate_dir: plates
 plate:
   enable: true
   det_weights: weights/plate/yolov8n-plate.pt

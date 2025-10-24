@@ -24,5 +24,21 @@
       2285,
       1132
     ]
-  ]
+  ],
+  "meta": {
+    "mode": "auto_cv",
+    "metrics": {
+      "rel_area": 0.06438169126157407,
+      "roi_height": 707,
+      "roi_aspect": 2.1145685997171144,
+      "sharpness": 85.0,
+      "overlay_path": ""
+    },
+    "params": {
+      "min_box_h_px": 30,
+      "min_rel_area": 0.003,
+      "min_sharpness": 60.0,
+      "bbox_aspect_min": 0.6
+    }
+  }
 }
