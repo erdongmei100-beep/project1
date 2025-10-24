@@ -144,7 +144,14 @@ def _sample_frames(video_path: Path, params: AutoCVParams) -> Tuple[List[Tuple[i
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if frame_count <= 0:
         frame_count = params.sample_frames * 3
-    max_range = min(frame_count - 1, int((fps if fps > 0 else 25.0) * 5)) if frame_count > 0 else params.sample_frames
+    if fps > 0:
+        horizon_frames = int(fps * 12.0)
+    else:
+        horizon_frames = params.sample_frames * 4
+    if frame_count > 0:
+        max_range = min(frame_count - 1, horizon_frames)
+    else:
+        max_range = horizon_frames
     max_range = max(max_range, params.sample_frames)
     indices = sorted({int(round(x)) for x in np.linspace(0, max_range, params.sample_frames)})
     frames: List[Tuple[int, np.ndarray]] = []
@@ -191,28 +198,34 @@ def _generate_relaxed_variants(params: AutoCVParams) -> List[AutoCVParams]:
     variants: List[AutoCVParams] = []
     variants.append(
         params.evolve(
-            crop_right=min(params.crop_right + 0.18, 0.95),
-            crop_bottom=min(params.crop_bottom + 0.18, 0.98),
+            crop_right=min(params.crop_right + 0.18, 0.97),
+            crop_bottom=min(params.crop_bottom + 0.18, 0.99),
         )
     )
     variants.append(
         params.evolve(
             angle_min=max(params.angle_min - 10.0, 3.0),
-            angle_max=min(params.angle_max + 8.0, 88.0),
+            angle_max=min(params.angle_max + 10.0, 88.0),
         )
     )
     variants.append(
         params.evolve(
-            v_min=max(params.v_min - 35, 110),
-            s_max=min(params.s_max + 40, 180),
+            v_min=max(params.v_min - 45, 95),
+            s_max=min(params.s_max + 55, 200),
         )
     )
     variants.append(
         params.evolve(
-            crop_right=min(params.crop_right + 0.12, 0.98),
-            crop_bottom=min(params.crop_bottom + 0.22, 0.99),
+            crop_right=min(params.crop_right + 0.12, 0.99),
+            crop_bottom=min(params.crop_bottom + 0.24, 0.995),
             angle_min=max(params.angle_min - 14.0, 2.0),
             angle_max=min(params.angle_max + 12.0, 89.5),
+        )
+    )
+    variants.append(
+        params.evolve(
+            top_ratio=max(params.top_ratio - 0.05, 0.05),
+            bottom_margin=max(params.bottom_margin - 6, 4),
         )
     )
     return variants
@@ -448,7 +461,7 @@ def estimate_roi(
     detected, used_indices = _detect_lines_for_frames(frames, active_params)
     fallback_variant = 0
 
-    if not detected and params.allow_tail_fallback:
+    if not detected:
         for idx, variant in enumerate(_generate_relaxed_variants(params), start=1):
             detected_variant, used_variant = _detect_lines_for_frames(frames, variant)
             if detected_variant:

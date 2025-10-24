@@ -496,7 +496,7 @@ def main() -> None:
         print(f"Auto ROI enabled. Generating ROI to {roi_path}")
         previous_roi = roi_candidate if roi_candidate.exists() else None
         result = estimate_roi(source_path, params, overlay=params.save_debug)
-        if not result.success or result.polygon is None:
+        if result.polygon is None:
             print(f"Auto ROI failed: {result.message or '未知原因'}")
             if params.allow_tail_fallback and previous_roi is not None:
                 roi_path = previous_roi
@@ -519,7 +519,7 @@ def main() -> None:
         else:
             params_used = result.params_used
             meta = {
-                "mode": "auto_cv",
+                "mode": "auto_cv" if result.success else "auto_cv_relaxed",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "frames": result.used_frames,
                 "metrics": result.metrics,
@@ -543,6 +543,15 @@ def main() -> None:
                     "save_debug": params_used.save_debug,
                 },
             }
+            if not result.success:
+                meta["status"] = {
+                    "message": result.message or "validation_failed",
+                    "fallback_variant": result.metrics.get("fallback_variant", 0),
+                }
+                print(
+                    "Auto ROI 校验未通过，已保存最新多边形供复核: "
+                    f"{roi_path}"
+                )
             save_roi_json(roi_path, result.base_size, result.polygon, meta)
             overlay_path = result.metrics.get("overlay_path")
             if overlay_path:
