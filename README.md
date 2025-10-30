@@ -106,7 +106,7 @@ python run.py \
 
 ## 车牌识别与日志
 
-- 启用车牌 OCR 后，程序会在 `runs/plates/crops/` 目录下保存增强后的车牌裁剪图，并在 `runs/plates/plate_logs.csv` 中追加识别结果（文本、置信度、帧号、ROI 状态等）。
+- 启用车牌 OCR 后，程序会在 `data/outputs/<视频名>/plates/ocr_crops/` 下保存增强后的车牌裁剪图，并在同目录的 `plate_logs.csv` 中追加识别结果（文本、置信度、帧号、ROI 状态等）。
 - 事件导出的 `data/outputs/<视频名>/occupancy.csv` 会额外包含 `plate_text_conf` 与 `plate_ocr_image` 字段，方便与识别结果对账。
 - 如需禁用，可在 `configs/default.yaml` 中将 `plate.ocr.enable` 设为 `false`。
 

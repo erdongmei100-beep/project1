@@ -105,8 +105,15 @@ class PlateCollector:
         self.save_debug = bool(self.cfg.get("save_debug", False))
         self.preproc_cfg = dict(self.cfg.get("preproc", {}))
         self.preproc_debug = bool(self.preproc_cfg.get("save_debug", False))
-        self.ocr_cfg = dict(self.cfg.get("ocr", {}))
+        self.ocr_cfg = dict(self.cfg.get("ocr", {}) or {})
         self.ocr_enabled = bool(self.ocr_cfg.get("enable", False))
+        if self.ocr_enabled:
+            default_log = self.out_dir / "plate_logs.csv"
+            default_crops = self.out_dir / "ocr_crops"
+            if not self.ocr_cfg.get("log_csv_path"):
+                self.ocr_cfg["log_csv_path"] = default_log
+            if not self.ocr_cfg.get("crops_dir"):
+                self.ocr_cfg["crops_dir"] = default_crops
         self._plate_ocr = None
         self._ocr_error: Optional[str] = None
 
@@ -442,7 +449,7 @@ class PlateCollector:
         return clipped
     # <<< 修改结束
 
-    def _resolve_output_path(self, value: Optional[str], default: str) -> Path:
+    def _resolve_output_path(self, value: Optional[str | Path], default: str | Path) -> Path:
         target = Path(value) if value else Path(default)
         if not target.is_absolute():
             target = ROOT / target
@@ -457,10 +464,10 @@ class PlateCollector:
             from src.ocr import PlateOCR  # pylint: disable=import-outside-toplevel
 
             log_path = self._resolve_output_path(
-                self.ocr_cfg.get("log_csv_path"), "runs/plates/plate_logs.csv"
+                self.ocr_cfg.get("log_csv_path"), self.out_dir / "plate_logs.csv"
             )
             crops_dir = self._resolve_output_path(
-                self.ocr_cfg.get("crops_dir"), "runs/plates/crops"
+                self.ocr_cfg.get("crops_dir"), self.out_dir / "ocr_crops"
             )
             init_kwargs = {
                 "lang": self.ocr_cfg.get("lang", "ch"),

@@ -81,6 +81,6 @@ plate:
     enable: true           # 启用 PaddleOCR 文本识别
     lang: ch               # 车牌常用中文模型
     use_angle_cls: false   # 关闭角度分类提升性能
-    log_csv_path: runs/plates/plate_logs.csv  # 识别日志 CSV
-    crops_dir: runs/plates/crops              # OCR 裁剪图输出
+    log_csv_path: null     # 默认为 data/outputs/<视频名>/plates/plate_logs.csv
+    crops_dir: null        # 默认为 data/outputs/<视频名>/plates/ocr_crops/
     ensure_dirs: true
