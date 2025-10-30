@@ -1,10 +1,10 @@
 # run_one.ps1
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Proj = Join-Path $Root "project"
+$Repo = $Root
 
-if (!(Test-Path (Join-Path $Proj "run.py"))) {
-  Write-Host "[ERROR] 找不到 project\run.py" -ForegroundColor Red
+if (!(Test-Path (Join-Path $Repo "run.py"))) {
+  Write-Host "[ERROR] 找不到 run.py" -ForegroundColor Red
   Read-Host "按回车退出"
   exit 1
 }
@@ -12,7 +12,7 @@ if (!(Test-Path (Join-Path $Proj "run.py"))) {
 # 选视频
 Add-Type -AssemblyName System.Windows.Forms
 $dlg = New-Object System.Windows.Forms.OpenFileDialog
-$dlg.InitialDirectory = (Join-Path $Proj "data\videos")
+$dlg.InitialDirectory = (Join-Path $Repo "data\videos")
 $dlg.Filter = "Video files|*.mp4;*.mov;*.avi;*.mkv|All files|*.*"
 if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
   Write-Host "[INFO] 你取消了选择。"
@@ -20,21 +20,17 @@ if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
   exit 0
 }
 $src = $dlg.FileName
-$stem = [System.IO.Path]::GetFileNameWithoutExtension($src)
-$roiRel = "data\rois\$stem.json"
-
-# 选 Python：优先 .venv1，其次系统 python
-$py = Join-Path $Root ".venv1\Scripts\python.exe"
+# 选 Python：优先仓库内 .venv，其次系统 python
+$py = Join-Path $Repo ".venv\Scripts\python.exe"
 if (!(Test-Path $py)) { $py = "python" }
 
 # 打印摘要
 Write-Host "[RUN] video=$src"
-Write-Host "[RUN] roi  =$roiRel"
 Write-Host "[RUN] exec =$py"
 
-Push-Location $Proj
+Push-Location $Repo
 try {
-  & $py "run.py" --source "$src" --config "configs\default.yaml" --save-video --save-csv --roi "$roiRel"
+  & $py "run.py" --source "$src" --config "configs\default.yaml" --save-video --save-csv"
   $rc = $LASTEXITCODE
 } finally {
   Pop-Location

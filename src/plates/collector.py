@@ -9,7 +9,9 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .detector_yolo import PlateDetector
+from src.utils.paths import OUTPUTS_DIR, ROOT, WEIGHTS_DIR
+
+from .detector import PlateDetector
 from .preprocess import enhance_plate
 from .quality import (
     angle_penalty,
@@ -90,14 +92,23 @@ class PlateCandidate:
 class PlateCollector:
     """Maintain plate detection candidates per track/event."""
 
-    def __init__(self, cfg_plate: dict, out_dir: Path, detector: Optional[PlateDetector] = None) -> None:
+    def __init__(
+        self,
+        cfg_plate: dict,
+        out_dir: Path | None,
+        detector: Optional[PlateDetector] = None,
+    ) -> None:
         self.cfg = dict(cfg_plate or {})
-        self.out_dir = Path(out_dir)
+        self.out_dir = Path(out_dir) if out_dir else OUTPUTS_DIR / "plates"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.debug_dir = self.out_dir / "debug"
         self.save_debug = bool(self.cfg.get("save_debug", False))
         self.preproc_cfg = dict(self.cfg.get("preproc", {}))
         self.preproc_debug = bool(self.preproc_cfg.get("save_debug", False))
+        self.ocr_cfg = dict(self.cfg.get("ocr", {}))
+        self.ocr_enabled = bool(self.ocr_cfg.get("enable", False))
+        self._plate_ocr = None
+        self._ocr_error: Optional[str] = None
 
         classes_allow = self.cfg.get("classes_allow")
         aspect_min = float(self.cfg.get("bbox_aspect_min", 0.9))
@@ -109,7 +120,9 @@ class PlateCollector:
         self.pick_mode = str(self.cfg.get("pick_mode", "full")).lower()
         self.entry_window_frames = max(int(self.cfg.get("entry_window_frames", 0)), 0)
 
-        weights_path = Path(str(self.cfg.get("det_weights", "weights/plate/yolov8n-plate.pt")))
+        det_weights_default = WEIGHTS_DIR / "plate" / "yolov8n-plate.pt"
+        weights_cfg = self.cfg.get("det_weights")
+        weights_path = Path(str(weights_cfg)) if weights_cfg else det_weights_default
         device = str(self.cfg.get("device", "cpu"))
         imgsz = int(self.cfg.get("imgsz", 320))
         conf = float(self.cfg.get("conf", 0.25))
@@ -229,7 +242,14 @@ class PlateCollector:
         return self.vehicle_filter.is_vehicle(track_label_votes, bbox_wh, frame_h)
 
     def finalize_and_save(
-        self, event_id: int, track_id: int, start_frame: Optional[int] = None
+        self,
+        event_id: int,
+        track_id: int,
+        start_frame: Optional[int] = None,
+        *,
+        fps: Optional[float] = None,
+        cam_id: Optional[str] = None,
+        roi_flag: Optional[bool] = None,
     ) -> Dict[str, object]:
         meta: Dict[str, object] = {
             "plate_img": "",
@@ -238,6 +258,8 @@ class PlateCollector:
             "plate_text": "null",
             "tail_img": "",
             "plate_sharp_post": None,
+            "plate_text_conf": None,
+            "plate_ocr_image": "",
         }
 
         candidates = list(self._candidates.get(track_id, []))
@@ -263,6 +285,19 @@ class PlateCollector:
                 meta["plate_sharp_post"] = preproc_result.get("sharpness")
                 if self.preproc_debug:
                     self._save_preproc_debug(event_id, track_id, preproc_result.get("stages", {}))
+                ocr_res = self._maybe_run_plate_ocr(
+                    final_bgr,
+                    best.xyxy_full,
+                    frame_idx=best.frame_idx,
+                    fps=fps,
+                    cam_id=cam_id,
+                    roi_flag=roi_flag,
+                )
+                if ocr_res.get("ok"):
+                    text_val = ocr_res.get("text")
+                    meta["plate_text"] = text_val if text_val else "null"
+                    meta["plate_text_conf"] = ocr_res.get("conf")
+                    meta["plate_ocr_image"] = ocr_res.get("image_path", "")
             else:
                 print(f"Failed to save plate image: {plate_path}")
         elif self.allow_tail_fallback and not self.only_with_plate:
@@ -406,4 +441,71 @@ class PlateCollector:
             return cv2.cvtColor(clipped, cv2.COLOR_GRAY2BGR)
         return clipped
     # <<< 修改结束
+
+    def _resolve_output_path(self, value: Optional[str], default: str) -> Path:
+        target = Path(value) if value else Path(default)
+        if not target.is_absolute():
+            target = ROOT / target
+        return target
+
+    def _ensure_plate_ocr(self):
+        if not self.ocr_enabled:
+            return None
+        if self._plate_ocr is not None or self._ocr_error:
+            return self._plate_ocr
+        try:
+            from src.ocr import PlateOCR  # pylint: disable=import-outside-toplevel
+
+            log_path = self._resolve_output_path(
+                self.ocr_cfg.get("log_csv_path"), "runs/plates/plate_logs.csv"
+            )
+            crops_dir = self._resolve_output_path(
+                self.ocr_cfg.get("crops_dir"), "runs/plates/crops"
+            )
+            init_kwargs = {
+                "lang": self.ocr_cfg.get("lang", "ch"),
+                "use_angle_cls": bool(self.ocr_cfg.get("use_angle_cls", False)),
+                "rec": bool(self.ocr_cfg.get("rec", True)),
+                "det": bool(self.ocr_cfg.get("det", False)),
+                "ocr_model_dir": self.ocr_cfg.get("ocr_model_dir") or None,
+                "log_csv_path": log_path,
+                "crops_dir": crops_dir,
+                "ensure_dirs": bool(self.ocr_cfg.get("ensure_dirs", True)),
+            }
+            self._plate_ocr = PlateOCR(**init_kwargs)
+        except Exception as exc:  # pragma: no cover - PaddleOCR optional
+            self._ocr_error = str(exc)
+            print(f"Plate OCR 未启用：{exc}")
+        return self._plate_ocr
+
+    def _maybe_run_plate_ocr(
+        self,
+        plate_img: np.ndarray,
+        bbox_xyxy: List[int],
+        *,
+        frame_idx: int,
+        fps: Optional[float],
+        cam_id: Optional[str],
+        roi_flag: Optional[bool],
+    ) -> Dict[str, object]:
+        ocr = self._ensure_plate_ocr()
+        if ocr is None:
+            return {"ok": False, "err": self._ocr_error or "ocr_disabled"}
+
+        video_time_ms: Optional[int] = None
+        if fps and fps > 0 and frame_idx >= 0:
+            video_time_ms = int(round(frame_idx / fps * 1000))
+        try:
+            return ocr.recognize(
+                crop_bgr=plate_img,
+                bbox_xyxy=(int(bbox_xyxy[0]), int(bbox_xyxy[1]), int(bbox_xyxy[2]), int(bbox_xyxy[3])),
+                frame_idx=frame_idx,
+                video_time_ms=video_time_ms,
+                cam_id=cam_id,
+                roi_flag=roi_flag,
+                save_crop=True,
+            )
+        except Exception as exc:  # pragma: no cover - PaddleOCR optional
+            print(f"Plate OCR 识别失败：{exc}")
+            return {"ok": False, "err": str(exc)}
 

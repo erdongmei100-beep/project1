@@ -24,5 +24,21 @@
       2385,
       991
     ]
-  ]
+  ],
+  "meta": {
+    "mode": "auto_cv",
+    "metrics": {
+      "rel_area": 0.0637939453125,
+      "roi_height": 824,
+      "roi_aspect": 1.7451456310679612,
+      "sharpness": 85.0,
+      "overlay_path": "data/outputs/auto_cv/exceptional_case_overlay.png"
+    },
+    "params": {
+      "min_box_h_px": 30,
+      "min_rel_area": 0.003,
+      "min_sharpness": 60.0,
+      "bbox_aspect_min": 0.6
+    }
+  }
 }

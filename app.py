@@ -9,7 +9,7 @@ from typing import List, Optional
 
 import streamlit as st
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+from src.utils.paths import ROOT
 DEFAULT_CONFIG = "configs/default.yaml"
 
 st.set_page_config(page_title="应急车道占用检测", page_icon="🚗", layout="centered")
@@ -60,6 +60,8 @@ if st.button("开始处理"):
                 video_path.write_bytes(uploaded_video.getbuffer())
             else:
                 video_path = Path(video_path_input.strip()).expanduser()
+                if not video_path.is_absolute():
+                    video_path = (ROOT / video_path).resolve()
 
             roi_override: Optional[Path] = None
             if roi_mode == "上传 ROI" and uploaded_roi is not None:
@@ -68,8 +70,10 @@ if st.button("开始处理"):
                 roi_override = roi_temp
             elif roi_mode == "本地路径" and roi_path_input.strip():
                 roi_override = Path(roi_path_input.strip()).expanduser()
+                if not roi_override.is_absolute():
+                    roi_override = (ROOT / roi_override).resolve()
 
-            command = [sys.executable, "run.py", "--source", str(video_path)]
+            command = [sys.executable, str(ROOT / "run.py"), "--source", str(video_path)]
             if config_path_input.strip():
                 command.extend(["--config", config_path_input.strip()])
             if roi_override is not None:
@@ -83,7 +87,7 @@ if st.button("开始处理"):
             if save_csv_flag:
                 command.append("--save-csv")
 
-            outputs_dir = PROJECT_ROOT / "data" / "outputs"
+            outputs_dir = ROOT / "data" / "outputs"
             before = set()
             if outputs_dir.exists():
                 before = {p for p in outputs_dir.glob("**/*") if p.is_file()}
@@ -91,7 +95,7 @@ if st.button("开始处理"):
             st.info("正在执行检测流程，请稍候……")
             result = subprocess.run(
                 command,
-                cwd=PROJECT_ROOT,
+                cwd=ROOT,
                 capture_output=True,
                 text=True,
             )
@@ -114,7 +118,7 @@ if st.button("开始处理"):
                     st.subheader("新增输出文件")
                     for file_path in new_files:
                         try:
-                            rel_path = file_path.relative_to(PROJECT_ROOT)
+                            rel_path = file_path.relative_to(ROOT)
                         except ValueError:
                             rel_path = file_path
                         st.write(f"- {rel_path}")

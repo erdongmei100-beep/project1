@@ -1,0 +1,4 @@
+video,success,duration_s,rel_area,roi_height,roi_aspect,sharpness,overlay_path,roi_path,message
+data/videos/ambulance.mp4,True,1.2,0.0912529538001543,872,2.0458715596330275,85.0,data/outputs/auto_cv/ambulance_overlay.png,data/rois/ambulance.json,
+data/videos/broken_down_vehicle.mp4,True,1.2,0.0499715470679012,646,2.3684210526315788,85.0,data/outputs/auto_cv/broken_down_vehicle_overlay.png,data/rois/broken_down_vehicle.json,
+data/videos/exceptional_case.mp4,True,1.2,0.0637939453125,824,1.7451456310679612,85.0,data/outputs/auto_cv/exceptional_case_overlay.png,data/rois/exceptional_case.json,

@@ -24,5 +24,21 @@
       3197,
       1735
     ]
-  ]
+  ],
+  "meta": {
+    "mode": "auto_cv",
+    "metrics": {
+      "rel_area": 0.04997154706790123,
+      "roi_height": 646,
+      "roi_aspect": 2.3684210526315788,
+      "sharpness": 85.0,
+      "overlay_path": "data/outputs/auto_cv/broken_down_vehicle_overlay.png"
+    },
+    "params": {
+      "min_box_h_px": 30,
+      "min_rel_area": 0.003,
+      "min_sharpness": 60.0,
+      "bbox_aspect_min": 0.6
+    }
+  }
 }
