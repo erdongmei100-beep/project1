@@ -202,6 +202,8 @@ def export_events(
                     "plate_text": meta.get("plate_text"),
                     "tail_img": meta.get("tail_img", ""),
                     "plate_sharp_post": meta.get("plate_sharp_post"),
+                    "plate_ocr_conf": meta.get("plate_ocr_conf"),
+                    "plate_ocr_img": meta.get("plate_ocr_img", ""),
                 }
             )
         rows.append(row)
@@ -214,6 +216,8 @@ def export_events(
             "plate_text",
             "tail_img",
             "plate_sharp_post",
+            "plate_ocr_conf",
+            "plate_ocr_img",
         ]:
             if column not in df.columns:
                 df[column] = None
@@ -622,7 +626,22 @@ def main() -> None:
                 conf=float(plate_cfg_resolved.get("conf", 0.25)),
                 iou=float(plate_cfg_resolved.get("iou", 0.45)),
             )
-            collector = PlateCollector(plate_cfg_resolved, plates_out_dir, detector=detector)
+            cam_id_cfg = plate_cfg_resolved.get("cam_id")
+            if cam_id_cfg is not None:
+                cam_id = str(cam_id_cfg)
+            else:
+                metadata_path = getattr(metadata, "path", None)
+                try:
+                    cam_id = Path(metadata_path).stem if metadata_path else source_path.stem
+                except Exception:
+                    cam_id = source_path.stem
+            collector = PlateCollector(
+                plate_cfg_resolved,
+                plates_out_dir,
+                detector=detector,
+                video_fps=metadata.fps,
+                cam_id=cam_id,
+            )
             plate_every_n_frames = max(getattr(collector, "every_n_frames", plate_every_n_frames), 1)
             if getattr(collector, "detector_available", False):
                 print(
@@ -651,6 +670,8 @@ def main() -> None:
             "plate_text": "null",
             "tail_img": "",
             "plate_sharp_post": None,
+            "plate_ocr_conf": None,
+            "plate_ocr_img": "",
         }
 
     try:
@@ -781,6 +802,7 @@ def main() -> None:
                             frame_idx=frame_idx,
                             car_xyxy_full=car_xyxy_full,
                             frame_bgr=frame,
+                            roi_flag=bool(entry.get("inside")),
                         )
                     except Exception as exc:
                         print(f"Plate collector update failed for track {entry['track_id']}: {exc}")

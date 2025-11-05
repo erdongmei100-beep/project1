@@ -44,6 +44,16 @@
 
    若已设置 `PIP_INDEX_URL`，脚本会沿用；否则默认使用清华镜像。
 
+### 车牌识别依赖
+
+新增的车牌文字识别模块依赖 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 及其底层框架 PaddlePaddle。
+安装依赖时请确保：
+
+- 先执行 `pip install paddleocr>=2.7.0`；
+- 根据硬件环境二选一安装 PaddlePaddle：CPU 环境使用 `pip install paddlepaddle>=2.5.0`，若使用 GPU 请根据本机 CUDA 版本选择匹配的 `paddlepaddle-gpu` 版本（例如 `paddlepaddle-gpu==2.5.2.post120`）。
+
+如未安装或版本不匹配，车牌 OCR 初始化会给出明确错误提示。
+
 ## 运行示例
 
 - Windows

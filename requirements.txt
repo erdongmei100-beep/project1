@@ -8,3 +8,8 @@ pyyaml==6.0.1
 requests==2.31.0
 streamlit==1.32.0
 tqdm==4.66.1
+paddleocr>=2.7.0
+# 二选一，根据环境选择 CPU/GPU 版本（不要同时装）
+paddlepaddle>=2.5.0; sys_platform == 'linux' and platform_machine != 'aarch64'
+# paddlepaddle-gpu 版本需与 CUDA 对齐，请由用户自行替换版本号，比如：
+# paddlepaddle-gpu==2.5.2.post120  # 示例

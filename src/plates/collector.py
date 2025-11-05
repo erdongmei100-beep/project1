@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from src.utils.paths import OUTPUTS_DIR, WEIGHTS_DIR
+from src.ocr import PlateOCR
 
 from .detector import PlateDetector
 from .preprocess import enhance_plate
@@ -87,6 +88,7 @@ class PlateCandidate:
     sharpness: float
     score: float
     crop_bgr: np.ndarray
+    roi_flag: Optional[bool] = None
 
 
 class PlateCollector:
@@ -97,6 +99,8 @@ class PlateCollector:
         cfg_plate: dict,
         out_dir: Path | None,
         detector: Optional[PlateDetector] = None,
+        video_fps: Optional[float] = None,
+        cam_id: Optional[str] = None,
     ) -> None:
         self.cfg = dict(cfg_plate or {})
         self.out_dir = Path(out_dir) if out_dir else OUTPUTS_DIR / "plates"
@@ -149,12 +153,66 @@ class PlateCollector:
                 "Plate detector unavailable; falling back to tail image export only."
             )
 
+        self.video_fps: Optional[float] = None
+        if video_fps is not None:
+            try:
+                fps_val = float(video_fps)
+                if fps_val > 0:
+                    self.video_fps = fps_val
+            except (TypeError, ValueError):
+                self.video_fps = None
+
+        self.ocr_cfg = dict(self.cfg.get("ocr", {}))
+        if self.video_fps is None:
+            fps_cfg = self.ocr_cfg.get("video_fps")
+            try:
+                if fps_cfg is not None:
+                    fps_val = float(fps_cfg)
+                    if fps_val > 0:
+                        self.video_fps = fps_val
+            except (TypeError, ValueError):
+                self.video_fps = None
+
+        cam_cfg = self.ocr_cfg.get("cam_id")
+        if cam_cfg is not None:
+            self.cam_id = str(cam_cfg)
+        elif cam_id is not None:
+            self.cam_id = str(cam_id)
+        else:
+            self.cam_id = None
+
+        self.plate_ocr: Optional[PlateOCR] = None
+        self.ocr_enabled = bool(self.ocr_cfg.get("enable", True))
+        self.ocr_save_crop = bool(self.ocr_cfg.get("save_crop", True))
+        log_csv_default = "runs/plates/plate_logs.csv"
+        crops_dir_default = "runs/plates/crops"
+        log_csv_path = self.ocr_cfg.get("log_csv_path") or log_csv_default
+        crops_dir = self.ocr_cfg.get("crops_dir") or crops_dir_default
+        if self.ocr_enabled:
+            try:
+                self.plate_ocr = PlateOCR(
+                    lang=str(self.ocr_cfg.get("lang", "ch")),
+                    use_angle_cls=bool(self.ocr_cfg.get("use_angle_cls", False)),
+                    rec=bool(self.ocr_cfg.get("rec", True)),
+                    det=bool(self.ocr_cfg.get("det", False)),
+                    ocr_model_dir=self.ocr_cfg.get("ocr_model_dir"),
+                    log_csv_path=str(log_csv_path),
+                    crops_dir=str(crops_dir),
+                    ensure_dirs=bool(self.ocr_cfg.get("ensure_dirs", True)),
+                )
+            except Exception as exc:
+                print(f"Plate OCR unavailable; continuing without OCR: {exc}")
+                self.plate_ocr = None
+                self.ocr_enabled = False
+
+
     def update(
         self,
         track_id: int,
         frame_idx: int,
         car_xyxy_full: List[int],
         frame_bgr: np.ndarray,
+        roi_flag: Optional[bool] = None,
     ) -> Optional[PlateCandidate]:
         crop_info = self._crop_with_padding(frame_bgr, car_xyxy_full)
         if crop_info is None:
@@ -218,6 +276,7 @@ class PlateCollector:
                 sharpness=sharpness,
                 score=score,
                 crop_bgr=plate_crop.copy(),
+                roi_flag=roi_flag,
             )
             self._candidates.setdefault(track_id, []).append(candidate)
             if best_for_track is None or candidate.score > best_for_track.score:
@@ -263,6 +322,12 @@ class PlateCollector:
 
             final_img = preproc_result.get("final", best.crop_bgr)
             final_bgr = self._ensure_bgr(final_img)
+            ocr_result = self._run_plate_ocr(
+                final_bgr,
+                best.xyxy_full,
+                best.frame_idx,
+                best.roi_flag,
+            )
             plate_path = self.out_dir / f"event{event_id:02d}_track{track_id}_best.jpg"
             self.out_dir.mkdir(parents=True, exist_ok=True)
             if cv2.imwrite(str(plate_path), final_bgr):
@@ -274,6 +339,12 @@ class PlateCollector:
                     self._save_preproc_debug(event_id, track_id, preproc_result.get("stages", {}))
             else:
                 print(f"Failed to save plate image: {plate_path}")
+            if ocr_result and ocr_result.get("ok"):
+                text_val = ocr_result.get("text")
+                if text_val:
+                    meta["plate_text"] = str(text_val)
+                meta["plate_ocr_conf"] = ocr_result.get("conf")
+                meta["plate_ocr_img"] = ocr_result.get("image_path")
         elif self.allow_tail_fallback and not self.only_with_plate:
             tail_entry = self._tail_best.get(track_id)
             if tail_entry is not None:
@@ -351,6 +422,46 @@ class PlateCollector:
             f"track{track_id}_f{frame_idx}_s{candidate.score:.3f}.jpg"
         )
         cv2.imwrite(str(self.debug_dir / filename), candidate.crop_bgr)
+
+    def _frame_to_time_ms(self, frame_idx: int) -> Optional[int]:
+        if self.video_fps and self.video_fps > 0:
+            return int(round((frame_idx / self.video_fps) * 1000))
+        return None
+
+    def _run_plate_ocr(
+        self,
+        crop_bgr: np.ndarray,
+        bbox_xyxy: List[int],
+        frame_idx: int,
+        roi_flag: Optional[bool],
+    ) -> Optional[Dict[str, object]]:
+        if self.plate_ocr is None:
+            return None
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None
+        try:
+            bbox_tuple = (
+                int(bbox_xyxy[0]),
+                int(bbox_xyxy[1]),
+                int(bbox_xyxy[2]),
+                int(bbox_xyxy[3]),
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+        try:
+            video_time_ms = self._frame_to_time_ms(frame_idx)
+            return self.plate_ocr.recognize(
+                crop_bgr=crop_bgr,
+                bbox_xyxy=bbox_tuple,
+                frame_idx=frame_idx,
+                video_time_ms=video_time_ms,
+                cam_id=self.cam_id,
+                roi_flag=roi_flag if roi_flag is not None else True,
+                save_crop=self.ocr_save_crop,
+            )
+        except Exception as exc:
+            print(f"Plate OCR failed for frame {frame_idx}: {exc}")
+            return None
 
     # >>> 修改开始: 预处理调试图拼接
     def _save_preproc_debug(
