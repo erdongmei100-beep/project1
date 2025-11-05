@@ -58,7 +58,8 @@ class PlateOCR:
         self.log_csv_path = log_csv_path
         self.crops_dir = crops_dir
         if ensure_dirs:
-            os.makedirs(os.path.dirname(self.log_csv_path), exist_ok=True)
+            log_dir = os.path.dirname(self.log_csv_path) or "."
+            os.makedirs(log_dir, exist_ok=True)
             os.makedirs(self.crops_dir, exist_ok=True)
 
         # 若日志文件不存在，写入表头
@@ -124,7 +125,8 @@ class PlateOCR:
             ts = int(time.time())
             image_name = f"{ts}_{event_id}_{plate_text if plate_text else 'plate'}.jpg"
             image_path = os.path.join(self.crops_dir, image_name)
-            cv2.imwrite(image_path, crop_bgr)
+            if not cv2.imwrite(image_path, crop_bgr):
+                image_path = ""
 
         # 记录日志
         with open(self.log_csv_path, "a", newline="", encoding="utf-8") as f:

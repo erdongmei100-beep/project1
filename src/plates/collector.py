@@ -456,7 +456,7 @@ class PlateCollector:
                 frame_idx=frame_idx,
                 video_time_ms=video_time_ms,
                 cam_id=self.cam_id,
-                roi_flag=roi_flag if roi_flag is not None else True,
+                roi_flag=roi_flag,
                 save_crop=self.ocr_save_crop,
             )
         except Exception as exc:
