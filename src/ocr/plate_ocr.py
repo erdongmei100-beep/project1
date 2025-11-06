@@ -196,7 +196,7 @@ class PlateOCR:
                     ]
                 )
         return {
-            "ok": bool(text) and conf >= self.min_conf,
+            "ok": bool(text),
             "text": text,
             "conf": conf,
             "image_path": image_path,
