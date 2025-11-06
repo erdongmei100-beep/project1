@@ -62,6 +62,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Optional ROI JSON path. When omitted the auto_cv pipeline generates a ROI based on the config.",
     )
     parser.add_argument(
+        "--roi-mode",
+        required=False,
+        help="Override ROI mode (manual or auto_cv). When manual, existing ROI JSON will be used if available.",
+    )
+    parser.add_argument(
+        "--roi-dir",
+        required=False,
+        help="Directory containing manual ROI JSON files (defaults to config roi.dir).",
+    )
+    parser.add_argument(
         "--config",
         default=str(CONFIGS_DIR / "default.yaml"),
         help="Path to YAML configuration file relative to the repository root",
@@ -479,19 +489,40 @@ def main() -> None:
     )
 
     roi_cfg = dict(config.get("roi", {}) or {})
-    roi_mode = str(roi_cfg.get("mode", "manual")).lower()
-    roi_output_rel = roi_cfg.get("path")
-    if roi_output_rel:
-        roi_candidate = resolve_path(ROOT, roi_output_rel)
+    roi_mode_cfg = str(roi_cfg.get("mode", "manual")).lower()
+    roi_mode_override = (getattr(args, "roi_mode", "") or "").strip().lower()
+    roi_mode = roi_mode_override or roi_mode_cfg
+
+    roi_dir_value = getattr(args, "roi_dir", None) or roi_cfg.get("dir") or ""
+    if roi_dir_value:
+        roi_dir_path = resolve_path(ROOT, roi_dir_value)
     else:
-        default_roi_rel = ROOT / "data" / "rois" / f"{source_path.stem}.json"
-        roi_candidate = default_roi_rel
+        roi_dir_path = (ROOT / "data" / "rois").resolve()
+    roi_dir_path.mkdir(parents=True, exist_ok=True)
+
+    roi_path_value = roi_cfg.get("path")
+    if roi_path_value:
+        roi_candidate = resolve_path(ROOT, roi_path_value)
+    else:
+        roi_candidate = roi_dir_path / f"{source_path.stem}.json"
+    manual_candidate = roi_candidate
 
     roi_path: Optional[Path] = None
     if args.roi:
         roi_path = resolve_path(ROOT, args.roi)
         roi_mode = "manual"
-    elif roi_mode in {"auto", "auto_cv"}:
+    elif roi_mode == "manual":
+        if manual_candidate.exists():
+            roi_path = manual_candidate
+            print(f"Manual ROI enabled. Using {roi_path}")
+        else:
+            print(
+                f"Manual ROI mode selected but file not found: {manual_candidate}. "
+                "Falling back to auto ROI generation."
+            )
+            roi_mode = "auto_cv"
+
+    if roi_path is None and roi_mode in {"auto", "auto_cv"}:
         auto_cfg = roi_cfg.get("auto_cv") or roi_cfg.get("auto") or {}
         params = AutoCVParams.from_config(auto_cfg)
         target_dir = roi_candidate.parent
@@ -560,7 +591,7 @@ def main() -> None:
             overlay_path = result.metrics.get("overlay_path")
             if overlay_path:
                 print(f"Auto ROI overlay saved to {overlay_path}")
-    else:
+    elif roi_path is None:
         if roi_candidate is None:
             raise RuntimeError("ROI path must be provided when auto_cv is disabled.")
         roi_path = roi_candidate
@@ -597,10 +628,65 @@ def main() -> None:
 
     print(f"Output base directory: {video_output_dir}")
 
+    detect_cfg = dict(config.get("detect", {}) or {})
+    ocr_cfg_global = dict(config.get("ocr", {}) or {})
     plate_cfg = dict(config.get("plate", {}) or {})
-    plate_enabled = bool(args.plate or plate_cfg.get("enable", False))
+    roi_enabled = bool(roi_cfg.get("enable", True))
+
     plate_metadata: List[Dict[str, object]] = []
     collector = None
+    plate_weights_path: Optional[Path] = None
+    frame_plate_detector = None
+    frame_plate_ocr = None
+    frame_plate_cam_id: Optional[str] = None
+    frame_plate_runtime_enabled = False
+    ocr_save_crop = bool(ocr_cfg_global.get("save_crop", True))
+
+    if bool(ocr_cfg_global.get("enable", True)):
+        try:
+            from src.detect.plate_detector import PlateDetector as FramePlateDetector
+            from src.ocr.plate_ocr import PlateOCR as FramePlateOCR
+
+            if plate_weights_path is None:
+                plate_weights_path = ensure_plate_weights(plate_cfg.get("det_weights"))
+            frame_plate_detector = FramePlateDetector(
+                weights=str(plate_weights_path),
+                imgsz=int(detect_cfg.get("plate_imgsz", 1280)),
+                use_sahi=bool(detect_cfg.get("use_sahi", True)),
+                tile_size=int(detect_cfg.get("tile_size", 1024)),
+                tile_overlap=float(detect_cfg.get("tile_overlap", 0.2)),
+                device=str(plate_cfg.get("device", "")),
+            )
+            frame_plate_ocr = FramePlateOCR(
+                lang=str(ocr_cfg_global.get("lang", "ch")),
+                det=bool(ocr_cfg_global.get("det", False)),
+                rec=bool(ocr_cfg_global.get("rec", True)),
+                use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
+                ocr_model_dir=ocr_cfg_global.get("ocr_model_dir"),
+                log_csv_path=str(ocr_cfg_global.get("log_csv_path", "runs/plates/plate_logs.csv")),
+                crops_dir=str(ocr_cfg_global.get("crops_dir", "runs/plates/crops")),
+                min_height=int(ocr_cfg_global.get("min_height", 96)),
+                write_empty=bool(ocr_cfg_global.get("write_empty", True)),
+                min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
+            )
+            cam_id_cfg = ocr_cfg_global.get("cam_id")
+            if cam_id_cfg is not None:
+                frame_plate_cam_id = str(cam_id_cfg)
+            else:
+                try:
+                    frame_plate_cam_id = (
+                        Path(metadata.path).stem if getattr(metadata, "path", None) else source_path.stem
+                    )
+                except Exception:
+                    frame_plate_cam_id = source_path.stem
+            frame_plate_runtime_enabled = True
+        except Exception as exc:
+            print(f"Frame plate OCR pipeline unavailable: {exc}")
+            frame_plate_detector = None
+            frame_plate_ocr = None
+            frame_plate_runtime_enabled = False
+
+    plate_enabled = bool(args.plate or plate_cfg.get("enable", False))
     plate_every_n_frames = max(int(plate_cfg.get("every_n_frames", 1)), 1)
     vehicle_filter = VehicleFilter(
         plate_cfg.get("classes_allow"),
@@ -615,9 +701,11 @@ def main() -> None:
 
         plate_dirname = str(output_cfg.get("plate_dir") or "plates")
         plates_out_dir = video_output_dir / plate_dirname
-        weights_path = ensure_plate_weights(plate_cfg.get("det_weights"))
+        if plate_weights_path is None:
+            plate_weights_path = ensure_plate_weights(plate_cfg.get("det_weights"))
         plate_cfg_resolved = dict(plate_cfg)
-        plate_cfg_resolved["det_weights"] = str(weights_path)
+        plate_cfg_resolved["det_weights"] = str(plate_weights_path)
+        plate_cfg_resolved.setdefault("ocr", dict(ocr_cfg_global))
         try:
             detector = PlateDetector(
                 weights=plate_cfg_resolved["det_weights"],
@@ -661,6 +749,7 @@ def main() -> None:
     video_writer = None
     fps = metadata.fps or 25.0
     event_counter = 0
+    roi_polygon_np: Optional[np.ndarray] = None
 
     def _default_plate_meta() -> Dict[str, object]:
         return {
@@ -681,6 +770,17 @@ def main() -> None:
                 continue
             if frame_idx == 0:
                 roi_manager.ensure_ready((frame.shape[1], frame.shape[0]))
+                if roi_enabled:
+                    try:
+                        roi_polygon_np = (
+                            np.array(roi_manager.polygon, dtype=np.int32)
+                            if roi_manager.polygon
+                            else None
+                        )
+                    except Exception:
+                        roi_polygon_np = None
+                else:
+                    roi_polygon_np = None
                 if args.save_video:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_path = video_output_dir / output_cfg.get(
@@ -696,6 +796,55 @@ def main() -> None:
                         print(f"Saving annotated video to {video_path}")
                     else:
                         print(f"Failed to open video writer at {video_path}")
+
+            if roi_enabled and roi_polygon_np is None:
+                try:
+                    roi_polygon_np = (
+                        np.array(roi_manager.polygon, dtype=np.int32)
+                        if roi_manager.polygon
+                        else None
+                    )
+                except Exception:
+                    roi_polygon_np = None
+
+            if frame_plate_runtime_enabled and frame_plate_detector is not None and frame_plate_ocr is not None:
+                frame_h, frame_w = frame.shape[:2]
+                detections = frame_plate_detector.detect(frame)
+                time_ms = int(round((frame_idx / fps) * 1000)) if fps > 0 else None
+                for det_box in detections:
+                    if det_box is None or len(det_box) < 4:
+                        continue
+                    x1 = max(0, int(math.floor(det_box[0])))
+                    y1 = max(0, int(math.floor(det_box[1])))
+                    x2 = min(frame_w, int(math.ceil(det_box[2])))
+                    y2 = min(frame_h, int(math.ceil(det_box[3])))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    crop = frame[y1:y2, x1:x2]
+                    roi_flag = None
+                    if roi_enabled and roi_polygon_np is not None and len(roi_polygon_np) >= 3:
+                        cx = (x1 + x2) // 2
+                        cy = (y1 + y2) // 2
+                        try:
+                            roi_flag = (
+                                cv2.pointPolygonTest(roi_polygon_np, (cx, cy), False) >= 0
+                            )
+                        except Exception:
+                            roi_flag = None
+                    ocr_result = frame_plate_ocr.recognize(
+                        crop_bgr=crop,
+                        bbox_xyxy=(x1, y1, x2, y2),
+                        frame_idx=frame_idx,
+                        video_time_ms=time_ms,
+                        cam_id=frame_plate_cam_id,
+                        roi_flag=roi_flag,
+                        save_crop=ocr_save_crop,
+                    )
+                    if ocr_result and not ocr_result.get("ok"):
+                        reason = ocr_result.get("reason", "")
+                        print(
+                            f"[OCR empty] frame={frame_idx} reason={reason} box=({x1},{y1},{x2},{y2})"
+                        )
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []

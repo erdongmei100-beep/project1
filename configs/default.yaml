@@ -7,10 +7,23 @@ tracking:
   iou: 0.45
   max_det: 1000
   tracker_config: configs/tracker/bytetrack.yaml
+ocr:
+  enable: true
+  min_height: 96        # 车牌裁剪最小高度像素
+  write_empty: true     # 即便识别为空也写CSV
+  min_conf: 0.25        # 低置信度也暂时写入
+
+detect:
+  plate_imgsz: 1280     # 车牌检测推理尺寸
+  use_sahi: true        # 大分辨率时启用切片推理
+  tile_size: 1024
+  tile_overlap: 0.2
+
 roi:
   enable: true  # 是否启用 ROI 裁剪逻辑
-  mode: auto_cv  # manual=使用已有 JSON，auto_cv=根据视频自动估计
-  path: ""  # 留空则默认写入 data/rois/<视频名>.json，可指定固定输出
+  mode: manual  # manual=使用已有 JSON，auto_cv=根据视频自动估计
+  dir: data/rois
+  path: ""  # 兼容旧配置，若提供则覆盖 dir 推导的路径
   auto_cv:
     sample_frames: 18        # 自动 ROI 检测时抽样的帧数
     crop_right: 0.45         # 右侧裁剪比例，聚焦车道线区域

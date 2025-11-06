@@ -190,6 +190,9 @@ class PlateCollector:
         crops_dir = self.ocr_cfg.get("crops_dir") or crops_dir_default
         if self.ocr_enabled:
             try:
+                min_height = int(self.ocr_cfg.get("min_height", 96))
+                write_empty = bool(self.ocr_cfg.get("write_empty", True))
+                min_conf = float(self.ocr_cfg.get("min_conf", 0.25))
                 self.plate_ocr = PlateOCR(
                     lang=str(self.ocr_cfg.get("lang", "ch")),
                     use_angle_cls=bool(self.ocr_cfg.get("use_angle_cls", False)),
@@ -198,7 +201,9 @@ class PlateCollector:
                     ocr_model_dir=self.ocr_cfg.get("ocr_model_dir"),
                     log_csv_path=str(log_csv_path),
                     crops_dir=str(crops_dir),
-                    ensure_dirs=bool(self.ocr_cfg.get("ensure_dirs", True)),
+                    min_height=min_height,
+                    write_empty=write_empty,
+                    min_conf=min_conf,
                 )
             except Exception as exc:
                 print(f"Plate OCR unavailable; continuing without OCR: {exc}")
@@ -339,12 +344,13 @@ class PlateCollector:
                     self._save_preproc_debug(event_id, track_id, preproc_result.get("stages", {}))
             else:
                 print(f"Failed to save plate image: {plate_path}")
-            if ocr_result and ocr_result.get("ok"):
-                text_val = ocr_result.get("text")
-                if text_val:
-                    meta["plate_text"] = str(text_val)
+            if ocr_result:
+                if ocr_result.get("ok"):
+                    text_val = ocr_result.get("text")
+                    if text_val:
+                        meta["plate_text"] = str(text_val)
                 meta["plate_ocr_conf"] = ocr_result.get("conf")
-                meta["plate_ocr_img"] = ocr_result.get("image_path")
+                meta["plate_ocr_img"] = ocr_result.get("image_path") or ""
         elif self.allow_tail_fallback and not self.only_with_plate:
             tail_entry = self._tail_best.get(track_id)
             if tail_entry is not None:
@@ -450,7 +456,7 @@ class PlateCollector:
             return None
         try:
             video_time_ms = self._frame_to_time_ms(frame_idx)
-            return self.plate_ocr.recognize(
+            result = self.plate_ocr.recognize(
                 crop_bgr=crop_bgr,
                 bbox_xyxy=bbox_tuple,
                 frame_idx=frame_idx,
@@ -459,6 +465,12 @@ class PlateCollector:
                 roi_flag=roi_flag,
                 save_crop=self.ocr_save_crop,
             )
+            if result and not result.get("ok"):
+                reason = result.get("reason", "")
+                print(
+                    f"[OCR empty] frame={frame_idx} reason={reason} box={bbox_tuple}"
+                )
+            return result
         except Exception as exc:
             print(f"Plate OCR failed for frame {frame_idx}: {exc}")
             return None

@@ -1,16 +1,11 @@
-# src/ocr/plate_ocr.py
-import os
 import csv
+import inspect
+import os
+import re
 import time
 import uuid
-from typing import Optional, Tuple, Dict, Any
-try:
-    import cv2
-except Exception as exc:  # pragma: no cover - environment specific dependency
-    cv2 = None
-    _CV_IMPORT_ERROR = exc
-else:
-    _CV_IMPORT_ERROR = None
+from typing import Any, Dict, Optional, Tuple
+import cv2
 
 try:
     from paddleocr import PaddleOCR
@@ -21,75 +16,92 @@ else:
     _IMPORT_ERROR = None
 
 
+def _ensure_dir(p):
+    if p and not os.path.exists(p):
+        os.makedirs(p, exist_ok=True)
+
+
+def _unsharp(img):
+    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
+    return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
+
+
+def _clahe(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+
 class PlateOCR:
-    """
-    封装 PaddleOCR 的车牌文本识别，并提供同时保存图片与记录 CSV 日志的便捷接口。
-    """
     def __init__(
         self,
         lang: str = "ch",
-        use_angle_cls: bool = False,
-        rec: bool = True,
         det: bool = False,
+        rec: bool = True,
+        use_angle_cls: bool = False,
         ocr_model_dir: Optional[str] = None,
         log_csv_path: str = "runs/plates/plate_logs.csv",
         crops_dir: str = "runs/plates/crops",
-        ensure_dirs: bool = True
+        min_height: int = 96,
+        write_empty: bool = True,
+        min_conf: float = 0.25,
     ):
-        if cv2 is None:
-            raise RuntimeError(
-                "OpenCV 未安装或缺少运行时依赖：{}".format(_CV_IMPORT_ERROR)
-            )
-
         if PaddleOCR is None:
-            raise RuntimeError(
-                "PaddleOCR 未安装：{}。请先安装 paddleocr 与 paddlepaddle / paddlepaddle-gpu".format(_IMPORT_ERROR)
-            )
+            raise RuntimeError(f"PaddleOCR 未安装：{_IMPORT_ERROR}")
 
-        # 只做识别（det=False），定位由外部检测器完成
-        self.ocr = PaddleOCR(
-            lang=lang,
-            det=det,
-            rec=rec,
-            use_angle_cls=use_angle_cls,
-            rec_model_dir=ocr_model_dir if ocr_model_dir else None,
-            show_log=False
-        )
+        init_params = inspect.signature(PaddleOCR).parameters
+        kwargs = dict(lang=lang, det=det, rec=rec, use_angle_cls=use_angle_cls)
+        if ocr_model_dir:
+            kwargs["rec_model_dir"] = ocr_model_dir
+        kwargs = {k: v for k, v in kwargs.items() if k in init_params}
+        self.ocr = PaddleOCR(**kwargs)
+
+        self.min_height = int(min_height)
+        self.write_empty = bool(write_empty)
+        self.min_conf = float(min_conf)
+
         self.log_csv_path = log_csv_path
         self.crops_dir = crops_dir
-        if ensure_dirs:
-            log_dir = os.path.dirname(self.log_csv_path) or "."
-            os.makedirs(log_dir, exist_ok=True)
-            os.makedirs(self.crops_dir, exist_ok=True)
+        _ensure_dir(os.path.dirname(self.log_csv_path))
+        _ensure_dir(self.crops_dir)
 
-        # 若日志文件不存在，写入表头
         if not os.path.exists(self.log_csv_path):
             with open(self.log_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "event_id",          # 唯一事件ID（每次检测一次生成）
-                    "timestamp",         # UNIX时间戳(s)
-                    "video_time_ms",     # 可选：视频毫秒时间（没用到可留空）
-                    "frame_idx",         # 帧号（无则写-1）
-                    "plate_text",        # 识别文本
-                    "rec_confidence",    # 识别置信度(0~1)
-                    "image_path",        # 裁剪图保存路径
-                    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",   # 车牌检测框（像素）
-                    "cam_id",            # 摄像头/通道ID
-                    "roi_flag",          # 是否处于ROI（应急车道），True/False/Unknown
-                ])
+                csv.writer(f).writerow(
+                    [
+                        "event_id",
+                        "timestamp",
+                        "video_time_ms",
+                        "frame_idx",
+                        "plate_text",
+                        "rec_confidence",
+                        "image_path",
+                        "bbox_x1",
+                        "bbox_y1",
+                        "bbox_x2",
+                        "bbox_y2",
+                        "cam_id",
+                        "roi_flag",
+                        "reason",
+                    ]
+                )
 
-    @staticmethod
-    def _preprocess(crop_bgr):
-        """可选的前处理：放大、去噪、增强等。默认仅保证最小高度。"""
-        if crop_bgr is None or crop_bgr.size == 0 or cv2 is None:
+    def _preprocess(self, crop_bgr):
+        if crop_bgr is None or crop_bgr.size == 0:
             return crop_bgr
         h, w = crop_bgr.shape[:2]
-        min_h = 48  # OCR 对小文字更友好
-        if h < min_h:
-            scale = min_h / max(1, h)
-            crop_bgr = cv2.resize(crop_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-        # 可选：添加 CLAHE、锐化等
+        if h < self.min_height:
+            scale = self.min_height / max(1, h)
+            crop_bgr = cv2.resize(
+                crop_bgr,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        crop_bgr = _clahe(crop_bgr)
+        crop_bgr = _unsharp(crop_bgr)
         return crop_bgr
 
     def recognize(
@@ -100,53 +112,93 @@ class PlateOCR:
         video_time_ms: Optional[int] = None,
         cam_id: Optional[str] = None,
         roi_flag: Optional[bool] = None,
-        save_crop: bool = True
+        save_crop: bool = True,
     ) -> Dict[str, Any]:
-        """
-        对单个车牌裁剪图进行识别，并可选保存图片与记录日志。
-        返回 dict，包含文本、置信度、保存路径等信息。
-        """
+        reason = ""
         if crop_bgr is None or crop_bgr.size == 0:
-            return {"ok": False, "err": "empty_crop"}
+            reason = "empty_crop"
+            return self._log(
+                "",
+                0.0,
+                "",
+                bbox_xyxy,
+                frame_idx,
+                video_time_ms,
+                cam_id,
+                roi_flag,
+                reason,
+            )
 
         crop_bgr = self._preprocess(crop_bgr)
-        # PaddleOCR 接收BGR/路径均可；这里直接传 ndarray
         rec = self.ocr.ocr(crop_bgr, cls=False)
-        plate_text, plate_conf = "", 0.0
+        text, conf = "", 0.0
         if rec and rec[0]:
-            # 取首个候选
-            plate_text = rec[0][0][1][0]
-            plate_conf = float(rec[0][0][1][1])
+            text = rec[0][0][1][0]
+            conf = float(rec[0][0][1][1])
+            if conf < self.min_conf:
+                reason = "low_conf"
+        else:
+            reason = "no_text"
 
-        # 保存裁剪图
         image_path = ""
         if save_crop:
-            event_id = str(uuid.uuid4())[:8]
+            eid = str(uuid.uuid4())[:8]
             ts = int(time.time())
-            image_name = f"{ts}_{event_id}_{plate_text if plate_text else 'plate'}.jpg"
-            image_path = os.path.join(self.crops_dir, image_name)
-            if not cv2.imwrite(image_path, crop_bgr):
-                image_path = ""
+            safe_txt = text if text else "plate"
+            safe_txt = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5]+", "", safe_txt) or "plate"
+            image_path = os.path.join(
+                self.crops_dir, f"{ts}_{eid}_{safe_txt}.jpg"
+            )
+            cv2.imwrite(image_path, crop_bgr)
 
-        # 记录日志
-        with open(self.log_csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                str(uuid.uuid4())[:8],          # event_id
-                int(time.time()),               # timestamp
-                int(video_time_ms) if video_time_ms is not None else "",   # video_time_ms
-                int(frame_idx) if frame_idx is not None else -1,           # frame_idx
-                plate_text,
-                round(plate_conf, 6),
-                image_path,
-                int(bbox_xyxy[0]), int(bbox_xyxy[1]), int(bbox_xyxy[2]), int(bbox_xyxy[3]),
-                str(cam_id) if cam_id is not None else "",
-                str(roi_flag) if roi_flag is not None else "Unknown",
-            ])
+        return self._log(
+            text,
+            conf,
+            image_path,
+            bbox_xyxy,
+            frame_idx,
+            video_time_ms,
+            cam_id,
+            roi_flag,
+            reason,
+        )
 
+    def _log(
+        self,
+        text,
+        conf,
+        image_path,
+        bbox_xyxy,
+        frame_idx,
+        video_time_ms,
+        cam_id,
+        roi_flag,
+        reason,
+    ):
+        if self.write_empty or text:
+            with open(self.log_csv_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        str(uuid.uuid4())[:8],
+                        int(time.time()),
+                        int(video_time_ms) if video_time_ms is not None else "",
+                        int(frame_idx) if frame_idx is not None else -1,
+                        text,
+                        round(conf, 6),
+                        image_path,
+                        int(bbox_xyxy[0]),
+                        int(bbox_xyxy[1]),
+                        int(bbox_xyxy[2]),
+                        int(bbox_xyxy[3]),
+                        str(cam_id) if cam_id is not None else "",
+                        str(roi_flag) if roi_flag is not None else "Unknown",
+                        reason,
+                    ]
+                )
         return {
-            "ok": True,
-            "text": plate_text,
-            "conf": plate_conf,
-            "image_path": image_path
+            "ok": bool(text) and conf >= self.min_conf,
+            "text": text,
+            "conf": conf,
+            "image_path": image_path,
+            "reason": reason,
         }
