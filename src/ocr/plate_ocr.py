@@ -6,23 +6,51 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
 import cv2
 
 try:
-    from paddleocr import PaddleOCR
+    from paddleocr import PaddleOCR as _RawPaddleOCR
 except Exception as e:
-    PaddleOCR = None
+    _RawPaddleOCR = None
     _IMPORT_ERROR = e
 else:
     _IMPORT_ERROR = None
 
 
+# --- BEGIN: hard guard to ban frame-level OCR ---
+class _SafePaddleOCR(_RawPaddleOCR if _RawPaddleOCR else object):
+    """
+    拦截对大图(整帧)的 OCR 调用：若图像任一边 > 512 像素，直接返回空结果。
+    这样即使上层误传整帧，也不会耗时/产出垃圾。
+    """
+
+    def ocr(self, img, *args, **kwargs):  # type: ignore[override]
+        try:
+            h, w = int(img.shape[0]), int(img.shape[1])
+            if h > 512 or w > 512:
+                return []  # 拒绝大图
+        except Exception:
+            pass
+        if _RawPaddleOCR is None:
+            return []
+        return super().ocr(img, *args, **kwargs)  # type: ignore[misc]
+
+
+# --- END ---
+
+
 def _check_dir_ok(d: str):
+    if not d:
+        return False, "dir_not_exist"
     p = Path(d)
-    required = ["inference.pdmodel", "inference.pdiparams"]
-    missing = [name for name in required if not (p / name).exists()]
-    has_meta = (p / "inference.json").exists()
-    return p.exists() and not missing, missing, has_meta
+    core_files = ["inference.pdmodel", "inference.pdiparams"]
+    if not p.exists():
+        return False, "dir_not_exist"
+    if not all((p / f).exists() for f in core_files):
+        return False, "core_files_missing"
+    has_meta = any((p / f).exists() for f in ["inference.json", "inference.yml", "inference.yaml"])
+    return True, ("ok" if has_meta else "ok_no_meta")
 
 
 def _ensure_dir(p):
@@ -61,25 +89,22 @@ class PlateOCR:
         write_empty: bool = True,
         min_conf: float = 0.25,
     ):
-        if PaddleOCR is None:
+        if _RawPaddleOCR is None:
             raise RuntimeError(f"PaddleOCR 未安装：{_IMPORT_ERROR}")
 
         self.rec_model_dir = str(ocr_model_dir) if ocr_model_dir is not None else ""
-        ok, missing, has_meta = _check_dir_ok(self.rec_model_dir)
-        if not self.rec_model_dir or not ok:
-            missing_str = ", ".join(missing) if missing else "必要文件"
+        ok, why = _check_dir_ok(self.rec_model_dir)
+        if not ok:
             raise RuntimeError(
-                f"PaddleOCR 本地识别模型不存在或不完整：{self.rec_model_dir}\n"
-                f"缺少文件: {missing_str}\n"
-                "请确保 inference.pdmodel 和 inference.pdiparams 位于该目录，并在 configs/default.yaml 的 ocr.rec_model_dir 指向该目录。"
+                f"PaddleOCR 模型目录不完整({why})：{self.rec_model_dir}"
             )
-        if not has_meta and not PlateOCR._warned_missing_meta:
+        if why == "ok_no_meta" and not PlateOCR._warned_missing_meta:
             print(
-                "[WARN] 未找到 inference.json，继续使用 PaddleOCR 识别模型。"
+                f"[WARN] OCR 模型缺少 meta 文件（json/yml），将按默认配置加载：{self.rec_model_dir}"
             )
             PlateOCR._warned_missing_meta = True
 
-        init_params = inspect.signature(PaddleOCR).parameters
+        init_params = inspect.signature(_RawPaddleOCR).parameters
         kwargs = dict(
             lang=lang,
             det=det,
@@ -89,11 +114,7 @@ class PlateOCR:
             use_gpu=bool(use_gpu),
         )
         kwargs = {k: v for k, v in kwargs.items() if k in init_params}
-        self.ocr = PaddleOCR(**kwargs)
-
-        self.min_height = int(min_height)
-        self.write_empty = bool(write_empty)
-        self.min_conf = float(min_conf)
+        self.ocr = _SafePaddleOCR(**kwargs)
 
         self.log_csv_path = log_csv_path
         self.crops_dir = crops_dir
@@ -121,6 +142,10 @@ class PlateOCR:
                     ]
                 )
 
+        self.min_height = int(min_height)
+        self.min_conf = float(min_conf)
+        self.write_empty = bool(write_empty)
+
     def _preprocess(self, crop_bgr):
         if crop_bgr is None or crop_bgr.size == 0:
             return crop_bgr
@@ -138,19 +163,19 @@ class PlateOCR:
 
     def recognize_crop(self, crop_bgr):
         """
-        对一张已裁剪的车牌 BGR 图做识别，返回 (text, conf)
-        不做任何保存或日志写入，由上层控制。
+        仅对一张已裁剪的车牌图做识别；不保存文件，不写日志。
+        返回: (text:str, conf:float)
         """
-        if crop_bgr is None or crop_bgr.size == 0:
+        if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
             return "", 0.0
         h = int(crop_bgr.shape[0])
-        if h < getattr(self, "min_height", 0):
+        if h < self.min_height:
             return "", 0.0
         try:
             res = self.ocr.ocr(crop_bgr, cls=False)
-            if not res or not res[0] or not res[0][0]:
+            if not res or not res[0]:
                 return "", 0.0
-            item = res[0][0]
+            item = res[0][0]  # [[box], (text, score)]
             text, conf = item[1][0], float(item[1][1])
             return text, conf
         except Exception:

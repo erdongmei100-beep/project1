@@ -9,6 +9,7 @@ tracking:
   tracker_config: configs/tracker/bytetrack.yaml
 ocr:
   enable: true
+  apply_on: crop         # 只在裁剪图上做 OCR
   use_gpu: false
   rec_model_dir: weights/ppocr/ch_PP-OCRv4_rec_infer  # 本地 PaddleOCR 识别模型目录
   min_height: 64        # 车牌裁剪最小高度像素

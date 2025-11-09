@@ -426,18 +426,21 @@ def _crop_with_padding(frame: np.ndarray, bbox: Tuple[float, float, float, float
 def save_plate_crop(
     frame: np.ndarray,
     bbox_xyxy: Tuple[int, int, int, int],
-    crops_dir: Path,
-    frame_idx: int,
-    identifier: Optional[Union[int, str]] = None,
     ocr: Optional[Any] = None,
     min_conf: float = 0.20,
-    write_empty: bool = True,
-    video_time_ms: Optional[int] = None,
+    crops_dir: Union[str, Path] = "runs/plates/crops",
+    timestamp: Optional[int] = None,
+    track_id: Optional[Union[int, str]] = None,
     cam_id: Optional[str] = None,
     roi_flag: Optional[bool] = None,
-    log_csv_path: Optional[Path] = None,
+    frame_idx: Optional[int] = None,
+    identifier: Optional[Union[int, str]] = None,
+    **_: Any,
 ) -> Tuple[str, str, float]:
-    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+    import os
+    import time as _time
+
+    x1, y1, x2, y2 = map(int, bbox_xyxy)
     frame_h, frame_w = frame.shape[:2]
     x1 = max(0, min(x1, frame_w))
     y1 = max(0, min(y1, frame_h))
@@ -447,60 +450,28 @@ def save_plate_crop(
         return "", "", 0.0
 
     crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
+    if getattr(crop, "size", 0) == 0:
         return "", "", 0.0
 
-    identifier_str = str(identifier) if identifier is not None else "det"
-    timestamp_label = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    filename = (
-        f"{timestamp_label}_{identifier_str}_f{frame_idx}_{x1}_{y1}_{x2}_{y2}.jpg"
+    ts = int(_time.time()) if timestamp is None else int(timestamp)
+    tid = (
+        str(track_id)
+        if track_id is not None
+        else (str(identifier) if identifier is not None else uuid.uuid4().hex[:8])
     )
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    crop_path = crops_dir / filename
-    saved = cv2.imwrite(str(crop_path), crop)
-    if not saved:
+    crops_dir_str = str(crops_dir)
+    os.makedirs(crops_dir_str, exist_ok=True)
+    out_path = os.path.join(crops_dir_str, f"{ts}_t{tid}.jpg")
+    if not cv2.imwrite(out_path, crop):
         return "", "", 0.0
 
     plate_text, plate_conf = "", 0.0
-    reason = ""
     if ocr is not None:
-        plate_text, plate_conf = ocr.recognize_crop(crop)
-        plate_conf = float(plate_conf)
-        if not plate_text:
-            reason = "no_text"
-        if plate_conf < min_conf:
-            if plate_text:
-                reason = "low_conf"
-            plate_text = ""
-            plate_conf = 0.0
+        text, conf = ocr.recognize_crop(crop)
+        if conf >= float(min_conf):
+            plate_text, plate_conf = text, float(conf)
 
-    if log_csv_path is not None and (write_empty or plate_text):
-        log_path = Path(log_csv_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        event_id = uuid.uuid4().hex[:8]
-        timestamp = int(time.time())
-        roi_str = str(roi_flag) if roi_flag is not None else "Unknown"
-        with open(log_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(
-                [
-                    event_id,
-                    timestamp,
-                    int(video_time_ms) if video_time_ms is not None else "",
-                    int(frame_idx),
-                    plate_text,
-                    round(float(plate_conf), 6),
-                    str(crop_path),
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    cam_id or "",
-                    roi_str,
-                    reason,
-                ]
-            )
-
-    return str(crop_path), plate_text, float(plate_conf)
+    return out_path, plate_text, plate_conf
 
 
 def export_plate_crops(
@@ -725,7 +696,6 @@ def main() -> None:
     frame_plate_runtime_enabled = False
     ocr_save_crop = bool(ocr_cfg_global.get("save_crop", True))
     ocr_min_conf = float(ocr_cfg_global.get("min_conf", 0.25))
-    ocr_write_empty = bool(ocr_cfg_global.get("write_empty", True))
     ocr_log_csv_cfg = ocr_cfg_global.get("log_csv_path") or "runs/plates/plate_logs.csv"
     ocr_log_csv_path = resolve_path(ROOT, str(ocr_log_csv_cfg))
     ocr_crops_dir_cfg = ocr_cfg_global.get("crops_dir") or "runs/plates/crops"
@@ -735,11 +705,11 @@ def main() -> None:
     ocr_warn_printed = False
     ocr_model_dir_cfg = ocr_cfg_global.get("rec_model_dir") or ocr_cfg_global.get("ocr_model_dir")
     ocr_use_gpu = bool(ocr_cfg_global.get("use_gpu", False))
+    ocr_apply_on = str(ocr_cfg_global.get("apply_on", "crop")).lower()
 
     if bool(ocr_cfg_global.get("enable", True)):
         try:
             from src.detect.plate_detector import PlateDetector as FramePlateDetector
-            from src.ocr.plate_ocr import PlateOCR as FramePlateOCR
 
             if plate_weights_path is None:
                 plate_weights_path = ensure_plate_weights(plate_cfg.get("det_weights"))
@@ -751,26 +721,29 @@ def main() -> None:
                 tile_overlap=float(detect_cfg.get("tile_overlap", 0.2)),
                 device=str(plate_cfg.get("device", "")),
             )
-            try:
-                frame_plate_ocr = FramePlateOCR(
-                    lang=str(ocr_cfg_global.get("lang", "ch")),
-                    det=bool(ocr_cfg_global.get("det", False)),
-                    rec=bool(ocr_cfg_global.get("rec", True)),
-                    use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
-                    ocr_model_dir=ocr_model_dir_cfg,
-                    use_gpu=ocr_use_gpu,
-                    log_csv_path=str(ocr_log_csv_path),
-                    crops_dir=str(ocr_crops_dir),
-                    min_height=int(ocr_cfg_global.get("min_height", 96)),
-                    write_empty=bool(ocr_cfg_global.get("write_empty", True)),
-                    min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
-                )
-                print(f"[OCR] Using local rec model: {ocr_model_dir_cfg}")
-            except Exception as exc:
-                print("\n==== OCR 初始化失败（不会联网下载）====")
-                print(str(exc))
-                print("====================================\n")
-                frame_plate_ocr = None
+            if ocr_apply_on == "crop":
+                try:
+                    from src.ocr.plate_ocr import PlateOCR as FramePlateOCR
+
+                    frame_plate_ocr = FramePlateOCR(
+                        lang=str(ocr_cfg_global.get("lang", "ch")),
+                        det=bool(ocr_cfg_global.get("det", False)),
+                        rec=bool(ocr_cfg_global.get("rec", True)),
+                        use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
+                        ocr_model_dir=ocr_model_dir_cfg,
+                        use_gpu=ocr_use_gpu,
+                        log_csv_path=str(ocr_log_csv_path),
+                        crops_dir=str(ocr_crops_dir),
+                        min_height=int(ocr_cfg_global.get("min_height", 96)),
+                        write_empty=bool(ocr_cfg_global.get("write_empty", True)),
+                        min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
+                    )
+                    print(f"[OCR] Using local rec model: {ocr_model_dir_cfg}")
+                except Exception as exc:
+                    print("\n==== OCR 初始化失败（不会联网下载）====")
+                    print(str(exc))
+                    print("====================================\n")
+                    frame_plate_ocr = None
             cam_id_cfg = ocr_cfg_global.get("cam_id")
             if cam_id_cfg is not None:
                 frame_plate_cam_id = str(cam_id_cfg)
@@ -955,21 +928,68 @@ def main() -> None:
                         continue
 
                     crop_identifier = f"det{det_idx}"
-                    log_path = ocr_log_csv_path if frame_plate_ocr is not None else None
-                    _, plate_text, plate_conf = save_plate_crop(
+                    crop_path, plate_text, plate_conf = save_plate_crop(
                         frame=frame,
                         bbox_xyxy=(x1, y1, x2, y2),
-                        crops_dir=ocr_crops_dir,
-                        frame_idx=frame_idx,
-                        identifier=crop_identifier,
                         ocr=frame_plate_ocr if frame_plate_ocr is not None else None,
                         min_conf=ocr_min_conf,
-                        write_empty=ocr_write_empty,
-                        video_time_ms=time_ms,
+                        crops_dir=ocr_crops_dir,
+                        timestamp=time_ms,
+                        track_id=crop_identifier,
                         cam_id=frame_plate_cam_id,
                         roi_flag=roi_flag,
-                        log_csv_path=log_path,
+                        frame_idx=frame_idx,
+                        identifier=crop_identifier,
                     )
+
+                    if (
+                        frame_plate_ocr is not None
+                        and crop_path
+                        and (frame_plate_ocr.write_empty or plate_text)
+                    ):
+                        log_path = Path(frame_plate_ocr.log_csv_path)
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not log_path.exists():
+                            with open(log_path, "w", newline="", encoding="utf-8") as f:
+                                csv.writer(f).writerow(
+                                    [
+                                        "event_id",
+                                        "timestamp",
+                                        "video_time_ms",
+                                        "frame_idx",
+                                        "plate_text",
+                                        "rec_confidence",
+                                        "image_path",
+                                        "bbox_x1",
+                                        "bbox_y1",
+                                        "bbox_x2",
+                                        "bbox_y2",
+                                        "cam_id",
+                                        "roi_flag",
+                                        "reason",
+                                    ]
+                                )
+                        event_id = uuid.uuid4().hex[:8]
+                        timestamp_now = int(time.time())
+                        with open(log_path, "a", newline="", encoding="utf-8") as f:
+                            csv.writer(f).writerow(
+                                [
+                                    event_id,
+                                    timestamp_now,
+                                    int(time_ms) if time_ms is not None else "",
+                                    int(frame_idx),
+                                    plate_text,
+                                    round(float(plate_conf), 6),
+                                    str(crop_path),
+                                    x1,
+                                    y1,
+                                    x2,
+                                    y2,
+                                    frame_plate_cam_id or "",
+                                    "" if roi_flag is None else roi_flag,
+                                    "",
+                                ]
+                            )
 
                     if frame_plate_ocr is not None and not plate_text:
                         print(
