@@ -17,10 +17,12 @@ else:
     _IMPORT_ERROR = None
 
 
-def _check_dir_ok(d: str) -> bool:
+def _check_dir_ok(d: str):
     p = Path(d)
-    need = ["inference.pdmodel", "inference.pdiparams", "inference.json"]
-    return p.exists() and all((p / n).exists() for n in need)
+    required = ["inference.pdmodel", "inference.pdiparams"]
+    missing = [name for name in required if not (p / name).exists()]
+    has_meta = (p / "inference.json").exists()
+    return p.exists() and not missing, missing, has_meta
 
 
 def _ensure_dir(p):
@@ -43,6 +45,8 @@ def _clahe(img):
 
 
 class PlateOCR:
+    _warned_missing_meta = False
+
     def __init__(
         self,
         lang: str = "ch",
@@ -61,11 +65,19 @@ class PlateOCR:
             raise RuntimeError(f"PaddleOCR 未安装：{_IMPORT_ERROR}")
 
         self.rec_model_dir = str(ocr_model_dir) if ocr_model_dir is not None else ""
-        if not self.rec_model_dir or not _check_dir_ok(self.rec_model_dir):
+        ok, missing, has_meta = _check_dir_ok(self.rec_model_dir)
+        if not self.rec_model_dir or not ok:
+            missing_str = ", ".join(missing) if missing else "必要文件"
             raise RuntimeError(
                 f"PaddleOCR 本地识别模型不存在或不完整：{self.rec_model_dir}\n"
-                "请将离线模型(含 inference.pdmodel/pdiparams/json)放到该目录，并在 configs/default.yaml 的 ocr.rec_model_dir 指向该目录。"
+                f"缺少文件: {missing_str}\n"
+                "请确保 inference.pdmodel 和 inference.pdiparams 位于该目录，并在 configs/default.yaml 的 ocr.rec_model_dir 指向该目录。"
             )
+        if not has_meta and not PlateOCR._warned_missing_meta:
+            print(
+                "[WARN] 未找到 inference.json，继续使用 PaddleOCR 识别模型。"
+            )
+            PlateOCR._warned_missing_meta = True
 
         init_params = inspect.signature(PaddleOCR).parameters
         kwargs = dict(
@@ -123,6 +135,26 @@ class PlateOCR:
         crop_bgr = _clahe(crop_bgr)
         crop_bgr = _unsharp(crop_bgr)
         return crop_bgr
+
+    def recognize_crop(self, crop_bgr):
+        """
+        对一张已裁剪的车牌 BGR 图做识别，返回 (text, conf)
+        不做任何保存或日志写入，由上层控制。
+        """
+        if crop_bgr is None or crop_bgr.size == 0:
+            return "", 0.0
+        h = int(crop_bgr.shape[0])
+        if h < getattr(self, "min_height", 0):
+            return "", 0.0
+        try:
+            res = self.ocr.ocr(crop_bgr, cls=False)
+            if not res or not res[0] or not res[0][0]:
+                return "", 0.0
+            item = res[0][0]
+            text, conf = item[1][0], float(item[1][1])
+            return text, conf
+        except Exception:
+            return "", 0.0
 
     def recognize(
         self,

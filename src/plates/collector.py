@@ -1,8 +1,12 @@
 """Collect plate detection candidates across events."""
 from __future__ import annotations
 
+import csv
 import math
+import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -434,6 +438,63 @@ class PlateCollector:
         )
         cv2.imwrite(str(self.debug_dir / filename), candidate.crop_bgr)
 
+    def _log_plate_result(
+        self,
+        bbox_xyxy: Tuple[int, int, int, int],
+        frame_idx: int,
+        video_time_ms: Optional[int],
+        roi_flag: Optional[bool],
+        text: str,
+        conf: float,
+        image_path: str,
+        reason: str,
+    ) -> None:
+        if self.plate_ocr is None:
+            return
+        if not (self.plate_ocr.write_empty or text):
+            return
+        log_path = Path(self.plate_ocr.log_csv_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        event_id = uuid.uuid4().hex[:8]
+        timestamp = int(time.time())
+        roi_str = str(roi_flag) if roi_flag is not None else "Unknown"
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                [
+                    event_id,
+                    timestamp,
+                    int(video_time_ms) if video_time_ms is not None else "",
+                    int(frame_idx),
+                    text,
+                    round(float(conf), 6),
+                    image_path,
+                    int(bbox_xyxy[0]),
+                    int(bbox_xyxy[1]),
+                    int(bbox_xyxy[2]),
+                    int(bbox_xyxy[3]),
+                    self.cam_id or "",
+                    roi_str,
+                    reason,
+                ]
+            )
+
+    def _save_ocr_crop_image(
+        self, crop_bgr: np.ndarray, text: str, frame_idx: int
+    ) -> str:
+        if self.plate_ocr is None:
+            return ""
+        crops_dir = Path(self.plate_ocr.crops_dir)
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        identifier = "".join(ch for ch in text if ch.isalnum()) if text else ""
+        if not identifier:
+            identifier = "plate"
+        timestamp_label = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        filename = f"{timestamp_label}_f{frame_idx}_{identifier}.jpg"
+        crop_path = crops_dir / filename
+        if cv2.imwrite(str(crop_path), crop_bgr):
+            return str(crop_path)
+        return ""
+
     def _frame_to_time_ms(self, frame_idx: int) -> Optional[int]:
         if self.video_fps and self.video_fps > 0:
             return int(round((frame_idx / self.video_fps) * 1000))
@@ -461,21 +522,45 @@ class PlateCollector:
             return None
         try:
             video_time_ms = self._frame_to_time_ms(frame_idx)
-            result = self.plate_ocr.recognize(
-                crop_bgr=crop_bgr,
-                bbox_xyxy=bbox_tuple,
-                frame_idx=frame_idx,
-                video_time_ms=video_time_ms,
-                cam_id=self.cam_id,
-                roi_flag=roi_flag,
-                save_crop=self.ocr_save_crop,
+            raw_text, raw_conf = self.plate_ocr.recognize_crop(crop_bgr)
+            conf = float(raw_conf)
+            text = raw_text
+            reason = ""
+            if not text:
+                reason = "no_text"
+            if conf < self.plate_ocr.min_conf:
+                if text:
+                    reason = "low_conf"
+                text = ""
+                conf = 0.0
+
+            image_path = ""
+            if self.ocr_save_crop:
+                image_path = self._save_ocr_crop_image(crop_bgr, raw_text, frame_idx)
+
+            self._log_plate_result(
+                bbox_tuple,
+                frame_idx,
+                video_time_ms,
+                roi_flag,
+                text,
+                conf,
+                image_path,
+                reason,
             )
-            if result and not result.get("ok"):
-                reason = result.get("reason", "")
+
+            if not text and reason:
                 print(
                     f"[OCR empty] frame={frame_idx} reason={reason} box={bbox_tuple}"
                 )
-            return result
+
+            return {
+                "ok": bool(text),
+                "text": text,
+                "conf": conf,
+                "image_path": image_path,
+                "reason": reason,
+            }
         except Exception as exc:
             print(f"Plate OCR failed for frame {frame_idx}: {exc}")
             return None
