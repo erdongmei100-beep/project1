@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -641,6 +642,15 @@ def main() -> None:
     frame_plate_cam_id: Optional[str] = None
     frame_plate_runtime_enabled = False
     ocr_save_crop = bool(ocr_cfg_global.get("save_crop", True))
+    ocr_log_csv_cfg = ocr_cfg_global.get("log_csv_path") or "runs/plates/plate_logs.csv"
+    ocr_log_csv_path = resolve_path(ROOT, str(ocr_log_csv_cfg))
+    ocr_crops_dir_cfg = ocr_cfg_global.get("crops_dir") or "runs/plates/crops"
+    ocr_crops_dir = resolve_path(ROOT, str(ocr_crops_dir_cfg))
+    if ocr_save_crop:
+        ocr_crops_dir.mkdir(parents=True, exist_ok=True)
+    ocr_warn_printed = False
+    ocr_model_dir_cfg = ocr_cfg_global.get("rec_model_dir") or ocr_cfg_global.get("ocr_model_dir")
+    ocr_use_gpu = bool(ocr_cfg_global.get("use_gpu", False))
 
     if bool(ocr_cfg_global.get("enable", True)):
         try:
@@ -657,18 +667,26 @@ def main() -> None:
                 tile_overlap=float(detect_cfg.get("tile_overlap", 0.2)),
                 device=str(plate_cfg.get("device", "")),
             )
-            frame_plate_ocr = FramePlateOCR(
-                lang=str(ocr_cfg_global.get("lang", "ch")),
-                det=bool(ocr_cfg_global.get("det", False)),
-                rec=bool(ocr_cfg_global.get("rec", True)),
-                use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
-                ocr_model_dir=ocr_cfg_global.get("ocr_model_dir"),
-                log_csv_path=str(ocr_cfg_global.get("log_csv_path", "runs/plates/plate_logs.csv")),
-                crops_dir=str(ocr_cfg_global.get("crops_dir", "runs/plates/crops")),
-                min_height=int(ocr_cfg_global.get("min_height", 96)),
-                write_empty=bool(ocr_cfg_global.get("write_empty", True)),
-                min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
-            )
+            try:
+                frame_plate_ocr = FramePlateOCR(
+                    lang=str(ocr_cfg_global.get("lang", "ch")),
+                    det=bool(ocr_cfg_global.get("det", False)),
+                    rec=bool(ocr_cfg_global.get("rec", True)),
+                    use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
+                    ocr_model_dir=ocr_model_dir_cfg,
+                    use_gpu=ocr_use_gpu,
+                    log_csv_path=str(ocr_log_csv_path),
+                    crops_dir=str(ocr_crops_dir),
+                    min_height=int(ocr_cfg_global.get("min_height", 96)),
+                    write_empty=bool(ocr_cfg_global.get("write_empty", True)),
+                    min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
+                )
+                print(f"[OCR] Using local rec model: {ocr_model_dir_cfg}")
+            except Exception as exc:
+                print("\n==== OCR 初始化失败（不会联网下载）====")
+                print(str(exc))
+                print("====================================\n")
+                frame_plate_ocr = None
             cam_id_cfg = ocr_cfg_global.get("cam_id")
             if cam_id_cfg is not None:
                 frame_plate_cam_id = str(cam_id_cfg)
@@ -679,7 +697,7 @@ def main() -> None:
                     )
                 except Exception:
                     frame_plate_cam_id = source_path.stem
-            frame_plate_runtime_enabled = True
+            frame_plate_runtime_enabled = frame_plate_detector is not None
         except Exception as exc:
             print(f"Frame plate OCR pipeline unavailable: {exc}")
             frame_plate_detector = None
@@ -768,6 +786,15 @@ def main() -> None:
             frame = result.orig_img
             if frame is None:
                 continue
+            if (
+                frame_idx == 0
+                and frame_plate_runtime_enabled
+                and frame_plate_detector is not None
+                and frame_plate_ocr is None
+                and not ocr_warn_printed
+            ):
+                print("[WARN] OCR 未启用：未找到本地模型或初始化失败。仅保存裁剪图。")
+                ocr_warn_printed = True
             if frame_idx == 0:
                 roi_manager.ensure_ready((frame.shape[1], frame.shape[0]))
                 if roi_enabled:
@@ -807,7 +834,7 @@ def main() -> None:
                 except Exception:
                     roi_polygon_np = None
 
-            if frame_plate_runtime_enabled and frame_plate_detector is not None and frame_plate_ocr is not None:
+            if frame_plate_runtime_enabled and frame_plate_detector is not None:
                 frame_h, frame_w = frame.shape[:2]
                 detections = frame_plate_detector.detect(frame)
                 time_ms = int(round((frame_idx / fps) * 1000)) if fps > 0 else None
@@ -831,6 +858,23 @@ def main() -> None:
                             )
                         except Exception:
                             roi_flag = None
+                    if frame_plate_ocr is None:
+                        if not ocr_warn_printed and frame_idx == 0:
+                            print(
+                                "[WARN] OCR 未启用：未找到本地模型或初始化失败。仅保存裁剪图。"
+                            )
+                            ocr_warn_printed = True
+                        elif not ocr_warn_printed:
+                            print(
+                                "[WARN] OCR 未启用：未找到本地模型或初始化失败。仅保存裁剪图。"
+                            )
+                            ocr_warn_printed = True
+                        if ocr_save_crop and crop.size > 0:
+                            ts_label = datetime.now().strftime("%Y%m%d%H%M%S%f")
+                            eid = uuid.uuid4().hex[:8]
+                            manual_name = f"{ts_label}_{eid}_{x1}_{y1}_{x2}_{y2}.jpg"
+                            cv2.imwrite(str(ocr_crops_dir / manual_name), crop)
+                        continue
                     ocr_result = frame_plate_ocr.recognize(
                         crop_bgr=crop,
                         bbox_xyxy=(x1, y1, x2, y2),

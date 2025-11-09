@@ -188,6 +188,10 @@ class PlateCollector:
         crops_dir_default = "runs/plates/crops"
         log_csv_path = self.ocr_cfg.get("log_csv_path") or log_csv_default
         crops_dir = self.ocr_cfg.get("crops_dir") or crops_dir_default
+        rec_model_dir = (
+            self.ocr_cfg.get("rec_model_dir") or self.ocr_cfg.get("ocr_model_dir")
+        )
+        use_gpu = bool(self.ocr_cfg.get("use_gpu", False))
         if self.ocr_enabled:
             try:
                 min_height = int(self.ocr_cfg.get("min_height", 96))
@@ -198,7 +202,8 @@ class PlateCollector:
                     use_angle_cls=bool(self.ocr_cfg.get("use_angle_cls", False)),
                     rec=bool(self.ocr_cfg.get("rec", True)),
                     det=bool(self.ocr_cfg.get("det", False)),
-                    ocr_model_dir=self.ocr_cfg.get("ocr_model_dir"),
+                    ocr_model_dir=rec_model_dir,
+                    use_gpu=use_gpu,
                     log_csv_path=str(log_csv_path),
                     crops_dir=str(crops_dir),
                     min_height=min_height,

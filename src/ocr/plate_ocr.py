@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 import cv2
 
@@ -14,6 +15,12 @@ except Exception as e:
     _IMPORT_ERROR = e
 else:
     _IMPORT_ERROR = None
+
+
+def _check_dir_ok(d: str) -> bool:
+    p = Path(d)
+    need = ["inference.pdmodel", "inference.pdiparams", "inference.json"]
+    return p.exists() and all((p / n).exists() for n in need)
 
 
 def _ensure_dir(p):
@@ -43,6 +50,7 @@ class PlateOCR:
         rec: bool = True,
         use_angle_cls: bool = False,
         ocr_model_dir: Optional[str] = None,
+        use_gpu: bool = False,
         log_csv_path: str = "runs/plates/plate_logs.csv",
         crops_dir: str = "runs/plates/crops",
         min_height: int = 96,
@@ -52,10 +60,22 @@ class PlateOCR:
         if PaddleOCR is None:
             raise RuntimeError(f"PaddleOCR 未安装：{_IMPORT_ERROR}")
 
+        self.rec_model_dir = str(ocr_model_dir) if ocr_model_dir is not None else ""
+        if not self.rec_model_dir or not _check_dir_ok(self.rec_model_dir):
+            raise RuntimeError(
+                f"PaddleOCR 本地识别模型不存在或不完整：{self.rec_model_dir}\n"
+                "请将离线模型(含 inference.pdmodel/pdiparams/json)放到该目录，并在 configs/default.yaml 的 ocr.rec_model_dir 指向该目录。"
+            )
+
         init_params = inspect.signature(PaddleOCR).parameters
-        kwargs = dict(lang=lang, det=det, rec=rec, use_angle_cls=use_angle_cls)
-        if ocr_model_dir:
-            kwargs["rec_model_dir"] = ocr_model_dir
+        kwargs = dict(
+            lang=lang,
+            det=det,
+            rec=rec,
+            use_angle_cls=use_angle_cls,
+            rec_model_dir=self.rec_model_dir,
+            use_gpu=bool(use_gpu),
+        )
         kwargs = {k: v for k, v in kwargs.items() if k in init_params}
         self.ocr = PaddleOCR(**kwargs)
 
