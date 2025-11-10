@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Set, Tuple
 
 # ---- import PaddleOCR (raw) ----
 _IMPORT_ERROR = ""
@@ -49,6 +49,9 @@ def _check_dir_ok(d: str) -> Tuple[bool, str]:
     return True, ("ok" if has_meta else "ok_no_meta")
 
 
+_WARNED_MODEL_DIRS: Set[str] = set()
+
+
 class PlateOCR:
     def __init__(
         self,
@@ -80,10 +83,11 @@ class PlateOCR:
         ok, why = _check_dir_ok(self.rec_model_dir)
         if not ok:
             raise RuntimeError(f"PaddleOCR 模型目录不完整({why})：{self.rec_model_dir}")
-        if why == "ok_no_meta":
+        if why == "ok_no_meta" and self.rec_model_dir not in _WARNED_MODEL_DIRS:
             print(
                 f"[WARN] OCR 模型缺少 meta 文件（json/yml），按默认配置加载：{self.rec_model_dir}"
             )
+            _WARNED_MODEL_DIRS.add(self.rec_model_dir)
 
         # 用安全代理，误传整帧也会被拦截为空
         self.ocr = _SafePaddleOCR(

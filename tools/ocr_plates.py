@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2  # type: ignore
 
@@ -38,7 +38,6 @@ class ImageJob:
     rel_path: str
     width: int
     height: int
-    image: Optional[Any] = None
 
 
 @dataclass
@@ -94,9 +93,7 @@ class BatchRunner:
         if job.width > 512 or job.height > 512:
             return None
 
-        img = job.image
-        if img is None:
-            img = cv2.imread(str(job.abs_path))
+        img = cv2.imread(str(job.abs_path))
         if img is None:
             return None
         start = time.perf_counter()
@@ -105,7 +102,6 @@ class BatchRunner:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         if conf < self.min_conf:
             text = ""
-        job.image = None  # release reference
         return JobResult(
             rel_path=job.rel_path,
             text=text,
@@ -132,7 +128,6 @@ class BatchRunner:
                 else:
                     stats.setdefault("will_process", 0)
                     stats["will_process"] += 1
-                job.image = None
             return results, stats
 
         from concurrent.futures import ThreadPoolExecutor
@@ -206,13 +201,14 @@ def scan_images(
             unreadable += 1
             continue
         h, w = int(img.shape[0]), int(img.shape[1])
+        # 释放图像引用，避免长批次时占用大量内存
+        img = None
         jobs.append(
             ImageJob(
                 abs_path=path,
                 rel_path=rel_path,
                 width=w,
                 height=h,
-                image=img,
             )
         )
     return jobs, total_images, already_done, unreadable
@@ -240,7 +236,7 @@ def append_results(csv_path: Path, rows: Sequence[JobResult], used_gpu: bool) ->
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(CSV_HEADER)
-        for row in rows:
+        for row in sorted(rows, key=lambda r: r.rel_path):
             writer.writerow(
                 [
                     row.rel_path,
