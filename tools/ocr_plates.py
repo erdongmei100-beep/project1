@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import cv2  # type: ignore
+import numpy as np
+from PIL import Image, UnidentifiedImageError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -48,6 +49,7 @@ class JobResult:
     width: int
     height: int
     elapsed_ms: int
+    low_confidence: bool = False
 
 
 class BatchRunner:
@@ -93,14 +95,22 @@ class BatchRunner:
         if job.width > 512 or job.height > 512:
             return None
 
-        img = cv2.imread(str(job.abs_path))
-        if img is None:
+        try:
+            with Image.open(job.abs_path) as im:
+                crop_rgb = im.convert("RGB")
+                crop_np = np.asarray(crop_rgb)
+        except (OSError, UnidentifiedImageError):
             return None
+        if crop_np.size == 0:
+            return None
+        # Pillow gives RGB; PaddleOCR expects BGR
+        crop_bgr = crop_np[:, :, ::-1].copy()
         start = time.perf_counter()
         ocr = self._get_ocr()
-        text, conf = ocr.recognize_crop(img)
+        text, conf = ocr.recognize_crop(crop_bgr)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        if conf < self.min_conf:
+        low_conf = conf < self.min_conf
+        if low_conf:
             text = ""
         return JobResult(
             rel_path=job.rel_path,
@@ -109,6 +119,7 @@ class BatchRunner:
             width=job.width,
             height=job.height,
             elapsed_ms=elapsed_ms,
+            low_confidence=low_conf,
         )
 
     def run(self, jobs: Sequence[ImageJob], dry_run: bool) -> Tuple[List[JobResult], Dict[str, int]]:
@@ -117,6 +128,7 @@ class BatchRunner:
             "skipped_small": 0,
             "skipped_large": 0,
             "skipped_failed": 0,
+            "low_confidence": 0,
         }
         results: List[JobResult] = []
         if dry_run:
@@ -159,6 +171,9 @@ class BatchRunner:
                 res = fut.result()
                 if res is not None:
                     results.append(res)
+                    if res.low_confidence:
+                        stats.setdefault("low_confidence", 0)
+                        stats["low_confidence"] += 1
         stats["processed"] = len(results)
         return results, stats
 
@@ -196,19 +211,18 @@ def scan_images(
         if rel_path in processed_set:
             already_done += 1
             continue
-        img = cv2.imread(str(path))
-        if img is None:
+        try:
+            with Image.open(path) as im:
+                width, height = im.size
+        except (OSError, UnidentifiedImageError):
             unreadable += 1
             continue
-        h, w = int(img.shape[0]), int(img.shape[1])
-        # 释放图像引用，避免长批次时占用大量内存
-        img = None
         jobs.append(
             ImageJob(
                 abs_path=path,
                 rel_path=rel_path,
-                width=w,
-                height=h,
+                width=int(width),
+                height=int(height),
             )
         )
     return jobs, total_images, already_done, unreadable
@@ -285,6 +299,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     skipped_small = stats.get("skipped_small", 0)
     skipped_large = stats.get("skipped_large", 0)
     skipped_failed = stats.get("skipped_failed", 0) + unreadable
+    low_conf = stats.get("low_confidence", 0)
     newly_processed = (
         len(results)
         if not dry_run
@@ -306,6 +321,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if skipped_failed:
         print(f"Skipped (failed)  : {skipped_failed}")
     print(f"Newly processed   : {newly_processed}")
+    if low_conf:
+        print(
+            "  其中低于置信度阈值的有 "
+            f"{low_conf} 张，可通过 --min-conf 调整阈值。"
+        )
     print(f"Elapsed           : {elapsed:.2f}s")
     print("================================\n")
 
