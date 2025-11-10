@@ -87,6 +87,26 @@ python tools/ocr_plates.py \
 
 若终端摘要显示存在“低于置信度阈值”的图片，可适当降低 `--min-conf` 后重新运行。
 
+### YOLOv5 车牌检测 + HyperLPR 识别
+
+车辆裁剪阶段会在 `data/outputs/<run_name>/plates/` 下生成 `*_tail.jpg` 车辆 ROI。可使用新增脚本完成车牌检测、精确裁剪与 HyperLPR 识别：
+
+```bash
+python tools/run_plate_ocr.py \
+  --vehicle_dir data/outputs/<run_name>/plates/vehicle_roi \
+  --yolo_weights weights/plate_best.pt \
+  --out_dir runs/plates \
+  --download_url https://github.com/ultralytics/yolov5/releases/download/v6.0/yolov5n.pt
+```
+
+脚本会自动同步已有 `*_tail.jpg` 至 `vehicle_roi/` 子目录。默认通过 PyTorch Hub 加载 YOLOv5；如需使用本地 `yolov5/`，可追加 `--use_hub 0`。当本地权重缺失时，脚本会自动按 `--download_url`（留空则使用默认链接，亦可通过环境变量 `PLATE_YOLOV5_URL` 覆盖）下载模型并保存到指定路径。
+
+执行后会生成：
+
+- `runs/plates/results.csv`
+- `runs/plates/*_vis.jpg`
+- `runs/plates/*_cand{i}.jpg`
+
 ## 运行示例
 
 - Windows
