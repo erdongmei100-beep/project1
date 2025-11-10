@@ -768,13 +768,18 @@ def main() -> None:
                         det=bool(ocr_cfg_global.get("det", False)),
                         rec=bool(ocr_cfg_global.get("rec", True)),
                         use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
-                        ocr_model_dir=ocr_model_dir_cfg,
+                        ocr_model_dir=str(ocr_model_dir_cfg) if ocr_model_dir_cfg else None,
                         use_gpu=ocr_use_gpu,
                         log_csv_path=str(ocr_log_csv_path),
                         crops_dir=str(ocr_crops_dir),
                         min_height=int(ocr_cfg_global.get("min_height", 96)),
                         write_empty=bool(ocr_cfg_global.get("write_empty", True)),
                         min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
+                        engine=str(
+                            config.get("ocr_engine")
+                            or ocr_cfg_global.get("engine")
+                            or "rapidocr"
+                        ),
                     )
                     print(f"[OCR] Using local rec model: {ocr_model_dir_cfg}")
                 except Exception as exc:
@@ -890,11 +895,44 @@ def main() -> None:
             plate_cfg_resolved["save_fine_plate"] = _resolve_bool("save_fine_plate", True)
             plate_cfg_resolved["save_gray_plate"] = _resolve_bool("save_gray_plate", False)
             ocr_conf_min = _resolve_float("ocr_conf_min", 0.15)
+            ocr_engine_name = str(
+                config.get("ocr_engine")
+                or plate_cfg.get("ocr_engine")
+                or ocr_cfg_global.get("engine")
+                or "rapidocr"
+            )
             plate_cfg_resolved["ocr_conf_min"] = ocr_conf_min
+            plate_cfg_resolved["ocr_engine"] = ocr_engine_name
+            if ocr_model_dir_cfg:
+                plate_cfg_resolved["ocr_model_dir"] = str(ocr_model_dir_cfg)
+            plate_cfg_resolved["ocr_lang"] = str(ocr_cfg_global.get("lang", "ch"))
+            plate_cfg_resolved["ocr_det"] = bool(ocr_cfg_global.get("det", False))
+            plate_cfg_resolved["ocr_rec"] = bool(ocr_cfg_global.get("rec", True))
+            plate_cfg_resolved["ocr_use_angle_cls"] = bool(
+                ocr_cfg_global.get("use_angle_cls", False)
+            )
+            plate_cfg_resolved["ocr_use_gpu"] = ocr_use_gpu
+            plate_cfg_resolved["ocr_min_height"] = int(ocr_cfg_global.get("min_height", 96))
+            plate_cfg_resolved["ocr_write_empty"] = bool(
+                ocr_cfg_global.get("write_empty", True)
+            )
 
             plate_ocr_instance: Optional[PlateOCR] = None
             try:
-                plate_ocr_instance = PlateOCR(min_conf=ocr_conf_min)
+                plate_ocr_instance = PlateOCR(
+                    engine=plate_cfg_resolved.get("ocr_engine", "rapidocr"),
+                    min_conf=ocr_conf_min,
+                    lang=plate_cfg_resolved.get("ocr_lang", "ch"),
+                    det=plate_cfg_resolved.get("ocr_det", False),
+                    rec=plate_cfg_resolved.get("ocr_rec", True),
+                    use_angle_cls=plate_cfg_resolved.get("ocr_use_angle_cls", False),
+                    ocr_model_dir=plate_cfg_resolved.get("ocr_model_dir"),
+                    use_gpu=plate_cfg_resolved.get("ocr_use_gpu", False),
+                    min_height=plate_cfg_resolved.get("ocr_min_height", 96),
+                    write_empty=plate_cfg_resolved.get("ocr_write_empty", True),
+                    log_csv_path="",
+                    crops_dir="",
+                )
             except Exception as exc:
                 print(f"[plate] RapidOCR unavailable; continuing without OCR: {exc}")
                 plate_ocr_instance = None

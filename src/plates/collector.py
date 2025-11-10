@@ -89,6 +89,7 @@ class PlateCandidate:
     sharpness: float
     score: float
     crop_bgr: np.ndarray
+    plate_crop_bgr: np.ndarray
     roi_flag: Optional[bool] = None
 
 
@@ -179,8 +180,23 @@ class PlateCollector:
 
         self.plate_ocr: Optional[PlateOCR] = plate_ocr
         if self.plate_ocr is None:
+            ocr_engine = str(self.cfg.get("ocr_engine", "rapidocr"))
+            ocr_model_dir = self.cfg.get("ocr_model_dir")
             try:
-                self.plate_ocr = PlateOCR(min_conf=float(self.cfg.get("ocr_conf_min", 0.15)))
+                self.plate_ocr = PlateOCR(
+                    engine=ocr_engine,
+                    min_conf=float(self.cfg.get("ocr_conf_min", 0.15)),
+                    lang=self.cfg.get("ocr_lang", "ch"),
+                    det=bool(self.cfg.get("ocr_det", False)),
+                    rec=bool(self.cfg.get("ocr_rec", True)),
+                    use_angle_cls=bool(self.cfg.get("ocr_use_angle_cls", False)),
+                    ocr_model_dir=str(ocr_model_dir) if ocr_model_dir else None,
+                    use_gpu=bool(self.cfg.get("ocr_use_gpu", False)),
+                    min_height=int(self.cfg.get("ocr_min_height", 96)),
+                    write_empty=bool(self.cfg.get("ocr_write_empty", True)),
+                    log_csv_path="",
+                    crops_dir="",
+                )
             except Exception as exc:
                 print(f"[plate] Plate OCR unavailable; continuing without OCR: {exc}")
                 self.plate_ocr = None
@@ -219,6 +235,7 @@ class PlateCollector:
         if crop_info is None:
             return None
         crop_bgr, crop_x1, crop_y1 = crop_info
+        crop_context = crop_bgr.copy()
 
         car_area = (car_xyxy_full[2] - car_xyxy_full[0]) * (car_xyxy_full[3] - car_xyxy_full[1])
         if car_area <= 0:
@@ -277,7 +294,8 @@ class PlateCollector:
                 rel_area=rel_area,
                 sharpness=sharpness,
                 score=score,
-                crop_bgr=plate_crop.copy(),
+                crop_bgr=crop_context,
+                plate_crop_bgr=plate_crop.copy(),
                 roi_flag=roi_flag,
             )
             self._candidates.setdefault(track_id, []).append(candidate)
@@ -317,15 +335,17 @@ class PlateCollector:
         candidates = list(self._candidates.get(track_id, []))
         best = self._select_candidate(track_id, candidates, start_frame)
         if best is not None:
+            plate_focus_bgr = best.plate_crop_bgr if hasattr(best, "plate_crop_bgr") else best.crop_bgr
             try:
-                preproc_result = enhance_plate(best.crop_bgr, self.preproc_cfg, None)
+                preproc_result = enhance_plate(plate_focus_bgr, self.preproc_cfg, None)
             except Exception:
                 preproc_result = {
-                    "final": best.crop_bgr.copy(),
+                    "final": plate_focus_bgr.copy(),
                     "stages": {},
-                    "sharpness": laplacian_var(best.crop_bgr),
+                    "sharpness": laplacian_var(plate_focus_bgr),
                 }
 
+            plate_focus_bgr = self._ensure_bgr(plate_focus_bgr)
             plate_bgr = self._ensure_bgr(best.crop_bgr)
             plate_path = self.out_dir / f"event{event_id:02d}_track{track_id}_best.jpg"
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -349,6 +369,7 @@ class PlateCollector:
                 event_id,
                 track_id,
                 plate_bgr,
+                plate_focus_bgr,
                 rel_plate_path,
                 plate_path.stem,
             )
@@ -360,7 +381,12 @@ class PlateCollector:
                 tail_path = self.out_dir / f"event{event_id:02d}_track{track_id}_tail_best.jpg"
                 self.out_dir.mkdir(parents=True, exist_ok=True)
                 if cv2.imwrite(str(tail_path), tail_crop):
-                    meta["tail_img"] = str(Path("plates") / tail_path.name)
+                    tail_rel = self._normalize_rel_path(
+                        self.rel_plate_dir / tail_path.name
+                    )
+                    meta["tail_img"] = tail_rel
+                    if not meta.get("plate_ocr_img"):
+                        meta["plate_ocr_img"] = tail_rel
                 else:
                     print(
                         f"Failed to save tail image for track {track_id} frame {tail_frame_idx}."
@@ -400,6 +426,7 @@ class PlateCollector:
         event_id: int,
         track_id: int,
         plate_bgr: np.ndarray,
+        fallback_plate_bgr: np.ndarray,
         plate_rel_path: str,
         plate_name_stem: str,
     ) -> Dict[str, object]:
@@ -407,15 +434,17 @@ class PlateCollector:
             "plate_text": "null",
             "plate_ocr_conf": 0.0,
             "plate_ocr_img": plate_rel_path,
-            "plate_det_conf": None,
+            "plate_det_conf": 0.0,
             "plate_det_success": False,
         }
 
         if plate_bgr is None or plate_bgr.size == 0:
-            return result
+            if fallback_plate_bgr is None or fallback_plate_bgr.size == 0:
+                return result
+            plate_bgr = fallback_plate_bgr
 
-        crop_bgr = plate_bgr
-        det_conf: Optional[float] = None
+        crop_bgr = fallback_plate_bgr if fallback_plate_bgr is not None else plate_bgr
+        det_conf: float = 0.0
         det_failed = True
         ocr_image_rel = plate_rel_path
         det_bbox: Optional[Tuple[int, int, int, int]] = None
@@ -443,6 +472,11 @@ class PlateCollector:
                         print(f"[plate] Failed to save fine plate image: {fine_path}")
                 else:
                     ocr_image_rel = plate_rel_path
+            elif plate_rel_path:
+                print(
+                    f"[plate] event={event_id:02d} track={track_id} fine crop det_fail"
+                )
+                crop_bgr = fallback_plate_bgr if fallback_plate_bgr is not None else crop_bgr
 
         if self.plate_ocr is None:
             result["plate_ocr_img"] = ocr_image_rel
@@ -522,10 +556,9 @@ class PlateCollector:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             return
-        filename = (
-            f"track{track_id}_f{frame_idx}_s{candidate.score:.3f}.jpg"
-        )
-        cv2.imwrite(str(self.debug_dir / filename), candidate.crop_bgr)
+        filename = f"track{track_id}_f{frame_idx}_s{candidate.score:.3f}.jpg"
+        crop = candidate.plate_crop_bgr if hasattr(candidate, "plate_crop_bgr") else candidate.crop_bgr
+        cv2.imwrite(str(self.debug_dir / filename), crop)
 
     # >>> 修改开始: 预处理调试图拼接
     def _save_preproc_debug(
