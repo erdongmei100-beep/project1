@@ -2,10 +2,10 @@
 import glob
 import os
 import re
-import shutil
+import tempfile
 import urllib.request
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import BinaryIO, Iterable, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -21,6 +21,16 @@ _ENV_URL_KEYS = ("PLATE_YOLOV5_URL", "YOLOV5_PLATE_URL", "PLATE_WEIGHTS_URL")
 DEFAULT_LOCAL_WEIGHTS_URL = (
     "https://github.com/ultralytics/yolov5/releases/download/v6.0/yolov5n.pt"
 )
+
+_CHUNK_SIZE = 1 << 15  # 32 KiB
+
+
+def _iter_download_chunks(response: BinaryIO) -> Iterable[bytes]:
+    while True:
+        chunk = response.read(_CHUNK_SIZE)
+        if not chunk:
+            break
+        yield chunk
 
 
 def is_cn_plate(text: str) -> bool:
@@ -45,16 +55,49 @@ def _ensure_local_weights(weights: str, download_url: Optional[str]) -> Path:
 
     resolved_url = _resolve_download_url(download_url)
     weight_path.parent.mkdir(parents=True, exist_ok=True)
+    if not resolved_url:
+        raise RuntimeError(
+            "本地 YOLOv5 权重缺失且未提供下载链接。"
+            " 请通过 --download_url 或环境变量 PLATE_YOLOV5_URL 指定。"
+        )
+
     print(
         f"[lp_pipeline] 本地 YOLOv5 权重缺失，将从 {resolved_url} 下载至 {weight_path}"  # noqa: T201
     )
     try:
-        with urllib.request.urlopen(resolved_url) as response, open(weight_path, "wb") as f:
-            shutil.copyfileobj(response, f)
+        with urllib.request.urlopen(resolved_url) as response:
+            total = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            with tempfile.NamedTemporaryFile(
+                dir=str(weight_path.parent), delete=False
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                try:
+                    for chunk in _iter_download_chunks(response):
+                        tmp_file.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = downloaded / total * 100
+                            print(
+                                f"[lp_pipeline] 下载进度: {percent:5.1f}%",
+                                end="\r",
+                                flush=True,
+                            )
+                except Exception:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
+            if total:
+                print(" " * 40, end="\r", flush=True)
+            if weight_path.exists():
+                weight_path.unlink(missing_ok=True)
+            tmp_path.replace(weight_path)
     except Exception as exc:  # pragma: no cover - 网络异常
         raise RuntimeError(
             f"下载 YOLOv5 权重失败: {exc}. 请检查网络或手动放置 {weight_path}"
         ) from exc
+    if weight_path.stat().st_size == 0:
+        weight_path.unlink(missing_ok=True)
+        raise RuntimeError("下载的 YOLOv5 权重大小为 0，请检查下载链接是否正确。")
     return weight_path
 
 
