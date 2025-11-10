@@ -886,12 +886,20 @@ def main() -> None:
                 fine_weights_path = Path(plate_cfg_resolved["det_weights"])
             plate_cfg_resolved["plate_crop_weights"] = str(fine_weights_path)
 
-            fine_conf = _resolve_float("plate_crop_conf", 0.25, "plate_det_conf")
-            fine_imgsz = _resolve_int("plate_crop_imgsz", 640, "plate_det_imgsz")
-            fine_margin = _resolve_float("plate_crop_margin", 0.25, "plate_margin")
+            fine_conf = _resolve_float("plate_crop_conf", 0.20, "plate_det_conf")
+            fine_imgsz = _resolve_int("plate_crop_imgsz", 960, "plate_det_imgsz")
+            fine_margin = _resolve_float("plate_crop_margin", 0.12, "plate_margin")
             plate_cfg_resolved["plate_crop_conf"] = fine_conf
             plate_cfg_resolved["plate_crop_imgsz"] = fine_imgsz
             plate_cfg_resolved["plate_crop_margin"] = fine_margin
+            fine_mode = str(
+                _get_config_value("fine_crop_mode")
+                or config.get("fine_crop_mode")
+                or "reuse_bbox"
+            ).lower()
+            if fine_mode not in {"reuse_bbox", "redetect"}:
+                fine_mode = "reuse_bbox"
+            plate_cfg_resolved["fine_crop_mode"] = fine_mode
             plate_cfg_resolved["save_fine_plate"] = _resolve_bool("save_fine_plate", True)
             plate_cfg_resolved["save_gray_plate"] = _resolve_bool("save_gray_plate", False)
             ocr_conf_min = _resolve_float("ocr_conf_min", 0.15)
@@ -938,17 +946,18 @@ def main() -> None:
                 plate_ocr_instance = None
 
             fine_detector: Optional[FinePlateDetector] = None
-            try:
-                fine_detector = FinePlateDetector(
-                    weights=str(fine_weights_path),
-                    conf=fine_conf,
-                    imgsz=fine_imgsz,
-                    margin=fine_margin,
-                    device=str(plate_cfg_resolved.get("device", "cpu")),
-                )
-            except Exception as exc:
-                print(f"[plate] Fine plate detector unavailable: {exc}")
-                fine_detector = None
+            if fine_mode == "redetect":
+                try:
+                    fine_detector = FinePlateDetector(
+                        weights=str(fine_weights_path),
+                        conf=fine_conf,
+                        imgsz=fine_imgsz,
+                        margin=fine_margin,
+                        device=str(plate_cfg_resolved.get("device", "cpu")),
+                    )
+                except Exception as exc:
+                    print(f"[plate] Fine plate detector unavailable: {exc}")
+                    fine_detector = None
 
             try:
                 detector = CandidatePlateDetector(

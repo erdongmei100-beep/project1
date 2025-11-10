@@ -63,10 +63,11 @@ class PlateDetector:
             return None
         if img_bgr is None or img_bgr.size == 0:
             return None
-        height, width = img_bgr.shape[:2]
+        image = np.ascontiguousarray(np.asarray(img_bgr))
+        height, width = image.shape[:2]
         try:
             result = self._model.predict(
-                img_bgr,
+                image,
                 imgsz=self.imgsz,
                 conf=self.conf,
                 verbose=False,
