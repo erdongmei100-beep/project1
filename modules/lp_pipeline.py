@@ -1,8 +1,11 @@
 # modules/lp_pipeline.py
 import glob
+import importlib
 import os
 import re
+import sys
 import tempfile
+import types
 import urllib.request
 from pathlib import Path
 from typing import BinaryIO, Iterable, List, Tuple, Optional
@@ -122,13 +125,40 @@ def load_yolo(
         model.classes = None  # 只要权重是单类plate则不必指定
         return model, "hub"
     # 本地导入
-    import sys
-
     local_repo = Path("yolov5")
     if not local_repo.exists():
         raise RuntimeError("未找到本地 yolov5/ 目录。请执行 git submodule 或设置 --use_hub 1")
     if str(local_repo) not in sys.path:
         sys.path.append(str(local_repo))
+
+    def _ensure_ultralytics_torch_load() -> None:
+        """Provide ultralytics.utils.patches.torch_load for legacy YOLOv5 code."""
+
+        module_name = "ultralytics.utils.patches"
+        try:
+            patches = importlib.import_module(module_name)
+        except Exception:
+            patches = None
+
+        if patches is None:
+            utils_module_name = "ultralytics.utils"
+            utils_module = sys.modules.get(utils_module_name)
+            if utils_module is None:
+                utils_module = types.ModuleType(utils_module_name)
+                sys.modules[utils_module_name] = utils_module
+            patches = types.ModuleType("patches")
+            sys.modules[module_name] = patches
+            setattr(utils_module, "patches", patches)
+
+        if hasattr(patches, "torch_load"):
+            return
+
+        def _torch_load(path, *args, **kwargs):
+            return torch.load(os.fspath(path), *args, **kwargs)
+
+        patches.torch_load = _torch_load
+
+    _ensure_ultralytics_torch_load()
 
     from models.common import DetectMultiBackend  # type: ignore
     from utils.augmentations import letterbox  # type: ignore
