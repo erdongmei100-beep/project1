@@ -743,17 +743,81 @@ def main() -> None:
 
     if plate_enabled:
         from src.plates.collector import PlateCollector
-        from src.plates.detector import PlateDetector
+        from src.plates.detector import PlateDetector as CandidatePlateDetector
+        from src.plates.plate_det import PlateDetector as FinePlateDetector
+        from src.ocr.plate_ocr import PlateOCR
 
         plate_dirname = str(output_cfg.get("plate_dir") or "plates")
         plates_out_dir = video_output_dir / plate_dirname
         if plate_weights_path is None:
             plate_weights_path = ensure_plate_weights(plate_cfg.get("det_weights"))
+
         plate_cfg_resolved = dict(plate_cfg)
         plate_cfg_resolved["det_weights"] = str(plate_weights_path)
-        plate_cfg_resolved.setdefault("ocr", dict(ocr_cfg_global))
+
+        def _resolve_bool(key: str, default: bool) -> bool:
+            val = plate_cfg.get(key)
+            if val is None:
+                val = config.get(key, default)
+            return bool(val)
+
+        def _resolve_float(key: str, default: float) -> float:
+            val = plate_cfg.get(key)
+            if val is None:
+                val = config.get(key, default)
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _resolve_int(key: str, default: int) -> int:
+            val = plate_cfg.get(key)
+            if val is None:
+                val = config.get(key, default)
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return int(default)
+
+        fine_weights_value = plate_cfg.get("plate_det_weights") or config.get("plate_det_weights")
+        if fine_weights_value:
+            fine_weights_path = resolve_path(ROOT, fine_weights_value)
+        else:
+            fine_weights_path = Path(plate_cfg_resolved["det_weights"])
+        plate_cfg_resolved["plate_det_weights"] = str(fine_weights_path)
+
+        fine_conf = _resolve_float("plate_det_conf", 0.25)
+        fine_imgsz = _resolve_int("plate_det_imgsz", 640)
+        fine_margin = _resolve_float("plate_margin", 0.25)
+        plate_cfg_resolved["plate_det_conf"] = fine_conf
+        plate_cfg_resolved["plate_det_imgsz"] = fine_imgsz
+        plate_cfg_resolved["plate_margin"] = fine_margin
+        plate_cfg_resolved["save_fine_plate"] = _resolve_bool("save_fine_plate", True)
+        plate_cfg_resolved["save_gray_plate"] = _resolve_bool("save_gray_plate", False)
+        ocr_conf_min = _resolve_float("ocr_conf_min", 0.15)
+        plate_cfg_resolved["ocr_conf_min"] = ocr_conf_min
+
+        plate_ocr_instance: Optional[PlateOCR] = None
         try:
-            detector = PlateDetector(
+            plate_ocr_instance = PlateOCR(min_conf=ocr_conf_min)
+        except Exception as exc:
+            print(f"[plate] RapidOCR unavailable; continuing without OCR: {exc}")
+            plate_ocr_instance = None
+
+        fine_detector: Optional[FinePlateDetector] = None
+        try:
+            fine_detector = FinePlateDetector(
+                weights=str(fine_weights_path),
+                conf=fine_conf,
+                imgsz=fine_imgsz,
+                margin=fine_margin,
+            )
+        except Exception as exc:
+            print(f"[plate] Fine plate detector unavailable: {exc}")
+            fine_detector = None
+
+        try:
+            detector = CandidatePlateDetector(
                 weights=plate_cfg_resolved["det_weights"],
                 device=str(plate_cfg_resolved.get("device", "cpu")),
                 imgsz=int(plate_cfg_resolved.get("imgsz", 320)),
@@ -773,6 +837,8 @@ def main() -> None:
                 plate_cfg_resolved,
                 plates_out_dir,
                 detector=detector,
+                fine_detector=fine_detector,
+                plate_ocr=plate_ocr_instance,
                 video_fps=metadata.fps,
                 cam_id=cam_id,
             )

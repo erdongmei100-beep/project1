@@ -1,123 +1,62 @@
-# src/ocr/plate_ocr.py
+"""RapidOCR wrapper for plate text recognition."""
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import Tuple
 
-# ---- import PaddleOCR (raw) ----
-_IMPORT_ERROR = ""
-try:
-    from paddleocr import PaddleOCR as _RawPaddleOCR  # type: ignore
-except Exception as e:
-    _RawPaddleOCR = None  # type: ignore
-    _IMPORT_ERROR = repr(e)
+import cv2
+import numpy as np
 
-
-# ---- guard: forbid frame-level OCR by size ----
-class _SafePaddleOCR(_RawPaddleOCR if _RawPaddleOCR else object):  # type: ignore
-    """
-    安全代理：如果传入图像任一边 > 512，认为是“整帧/大图”，直接返回空结果，避免误用。
-    """
-
-    def ocr(self, img, *args, **kwargs):  # type: ignore[override]
-        try:
-            h = int(img.shape[0])
-            w = int(img.shape[1])
-            if h > 512 or w > 512:
-                return []  # 拒绝大图
-        except Exception:
-            # 不是ndarray也放行给上游处理
-            pass
-        return super().ocr(img, *args, **kwargs)  # type: ignore[misc]
-
-
-# ---- model-dir check (allow no json) ----
-def _check_dir_ok(d: str) -> Tuple[bool, str]:
-    """
-    必须包含: inference.pdmodel + inference.pdiparams
-    meta 文件(json/yml/yaml)可选；缺失时给出软警告但允许继续。
-    """
-    p = Path(d)
-    core = ["inference.pdmodel", "inference.pdiparams"]
-    if not p.exists():
-        return False, "dir_not_exist"
-    if not all((p / f).exists() for f in core):
-        return False, "core_files_missing"
-    has_meta = any(
-        (p / f).exists() for f in ["inference.json", "inference.yml", "inference.yaml"]
-    )
-    return True, ("ok" if has_meta else "ok_no_meta")
-
-
-_WARNED_MODEL_DIRS: Set[str] = set()
+try:  # pragma: no cover - runtime dependency
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+except Exception as exc:  # pragma: no cover - optional dependency
+    RapidOCR = None
+    _IMPORT_ERROR = repr(exc)
+else:
+    _IMPORT_ERROR = ""
 
 
 class PlateOCR:
-    def __init__(
-        self,
-        lang: str = "ch",
-        det: bool = False,
-        rec: bool = True,
-        use_angle_cls: bool = False,
-        ocr_model_dir: Optional[str] = None,
-        use_gpu: bool = False,
-        log_csv_path: str = "runs/plates/plate_logs.csv",
-        crops_dir: str = "runs/plates/crops",
-        min_height: int = 96,
-        write_empty: bool = True,
-        min_conf: float = 0.25,
-    ):
-        # 依赖检查
-        if _RawPaddleOCR is None:
-            raise RuntimeError(f"PaddleOCR 未安装: {_IMPORT_ERROR}")
+    """Perform OCR on cropped license plate images using RapidOCR."""
 
-        # 记录配置
-        self.rec_model_dir = str(ocr_model_dir) if ocr_model_dir is not None else ""
-        self.min_height = int(min_height)
+    def __init__(self, min_conf: float = 0.15) -> None:
+        if RapidOCR is None:
+            raise RuntimeError(f"RapidOCR 未安装或初始化失败: {_IMPORT_ERROR}")
+        self.ocr = RapidOCR()
         self.min_conf = float(min_conf)
-        self.write_empty = bool(write_empty)
-        self.log_csv_path = log_csv_path
-        self.crops_dir = crops_dir
+        print("[plate] Initialized RapidOCR engine")
 
-        # 模型目录校验（允许无 json）
-        ok, why = _check_dir_ok(self.rec_model_dir)
-        if not ok:
-            raise RuntimeError(f"PaddleOCR 模型目录不完整({why})：{self.rec_model_dir}")
-        if why == "ok_no_meta" and self.rec_model_dir not in _WARNED_MODEL_DIRS:
-            print(
-                f"[WARN] OCR 模型缺少 meta 文件（json/yml），按默认配置加载：{self.rec_model_dir}"
-            )
-            _WARNED_MODEL_DIRS.add(self.rec_model_dir)
+    def read(self, img_bgr: np.ndarray | None) -> Tuple[str, float]:
+        if img_bgr is None or getattr(img_bgr, "size", 0) == 0:
+            return "null", 0.0
 
-        # 用安全代理，误传整帧也会被拦截为空
-        self.ocr = _SafePaddleOCR(
-            lang=lang,
-            det=det,
-            rec=rec,
-            use_angle_cls=use_angle_cls,
-            rec_model_dir=self.rec_model_dir,
-            use_gpu=use_gpu,
-        )
+        h, w = img_bgr.shape[:2]
+        if max(h, w) < 200:
+            new_w = max(int(w * 2), 1)
+            new_h = max(int(h * 2), 1)
+            img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-    # 仅对“已裁剪的车牌小图”做识别
-    def recognize_crop(self, crop_bgr) -> Tuple[str, float]:
-        """
-        输入: BGR裁剪图 (ndarray)
-        输出: (text, conf). 失败/太小返回("", 0.0)
-        """
-        if crop_bgr is None:
-            return "", 0.0
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
         try:
-            if getattr(crop_bgr, "size", 0) <= 0:
-                return "", 0.0
-            h = int(crop_bgr.shape[0])
-            if h < self.min_height:
-                return "", 0.0
-            res = self.ocr.ocr(crop_bgr, cls=False)  # [[ [box], (text, score) ]]
-            if not res or not res[0]:
-                return "", 0.0
-            item = res[0][0]
-            text, conf = item[1][0], float(item[1][1])
-            return text, conf
+            result, _ = self.ocr(img)
         except Exception:
-            return "", 0.0
+            return "null", 0.0
+
+        if not result:
+            return "null", 0.0
+
+        text = str(result[0][0]).strip()
+        try:
+            conf = float(result[0][1])
+        except Exception:
+            conf = 0.0
+
+        if not text or conf < self.min_conf:
+            return "null", conf
+        return text, conf
+
+
+__all__ = ["PlateOCR"]
