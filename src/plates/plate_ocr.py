@@ -252,6 +252,7 @@ class PlateOCR:
 
     @staticmethod
     def _normalise_text(text: str) -> str:
+        cleaned = text
         for token in [" ", "·", "•", ".", "-"]:
             cleaned = cleaned.replace(token, "")
         cleaned = cleaned.upper()
