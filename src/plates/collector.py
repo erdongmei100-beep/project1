@@ -92,6 +92,7 @@ class PlateCandidate:
     score: float
     crop_bgr: np.ndarray
     plate_crop_bgr: np.ndarray
+    frame_bgr: np.ndarray
     roi_flag: Optional[bool] = None
 
 
@@ -265,6 +266,8 @@ class PlateCollector:
             return self._best_candidate.get(track_id)
 
         best_for_track = self._best_candidate.get(track_id)
+        frame_height, frame_width = frame_bgr.shape[:2]
+
         for det in detections:
             xyxy = det.get("xyxy")
             conf = float(det.get("conf", 0.0))
@@ -307,6 +310,7 @@ class PlateCollector:
                 score=score,
                 crop_bgr=crop_context,
                 plate_crop_bgr=plate_crop.copy(),
+                frame_bgr=frame_bgr.copy(),
                 roi_flag=roi_flag,
             )
             self._candidates.setdefault(track_id, []).append(candidate)
@@ -334,101 +338,82 @@ class PlateCollector:
             "plate_img": "",
             "plate_conf": None,
             "plate_score": None,
-            "plate_text": "null",
+            "plate_text": "",
             "tail_img": "",
             "plate_sharp_post": None,
             "plate_ocr_conf": 0.0,
             "plate_ocr_img": "",
-            "plate_det_conf": None,
-            "plate_det_success": False,
+            "fine_img": "",
+            "plate_bbox_xyxy": "",
+            "best_frame_img": "",
+            "best_frame_w": None,
+            "best_frame_h": None,
+            "plate_frame_idx": None,
         }
 
         candidates = list(self._candidates.get(track_id, []))
         best = self._select_candidate(track_id, candidates, start_frame)
-        if best is not None:
-            plate_focus_bgr = best.plate_crop_bgr if hasattr(best, "plate_crop_bgr") else best.crop_bgr
-            try:
-                preproc_result = enhance_plate(plate_focus_bgr, self.preproc_cfg, None)
-            except Exception:
-                preproc_result = {
-                    "final": plate_focus_bgr.copy(),
-                    "stages": {},
-                    "sharpness": laplacian_var(plate_focus_bgr),
-                }
 
-            plate_focus_bgr = self._ensure_bgr(plate_focus_bgr)
-            plate_bgr = self._ensure_bgr(best.crop_bgr)
-            plate_path = self.out_dir / f"event{event_id:02d}_track{track_id}_best.jpg"
-            self.out_dir.mkdir(parents=True, exist_ok=True)
-            saved = cv2.imwrite(str(plate_path), plate_bgr)
-            if saved:
-                rel_plate_path = self._normalize_rel_path(self.rel_plate_dir / plate_path.name)
-                meta["plate_img"] = rel_plate_path
-                meta["plate_sharp_post"] = preproc_result.get("sharpness")
-                if self.preproc_debug:
-                    self._save_preproc_debug(event_id, track_id, preproc_result.get("stages", {}))
-            else:
-                rel_plate_path = ""
-                print(f"Failed to save plate image: {plate_path}")
+        if best is None:
+            if self.allow_tail_fallback and not self.only_with_plate:
+                tail_entry = self._tail_best.get(track_id)
+                if tail_entry is not None:
+                    _, tail_frame_idx, tail_crop = tail_entry
+                    tail_name = f"event{event_id:02d}_track{track_id}_tail.jpg"
+                    tail_path = self.out_dir / tail_name
+                    self.out_dir.mkdir(parents=True, exist_ok=True)
+                    if cv2.imwrite(str(tail_path), tail_crop):
+                        rel_tail = self._normalize_rel_path(self.rel_plate_dir / tail_name)
+                        meta["tail_img"] = rel_tail
+                        print(
+                            f"[plate] fallback tail saved for track {track_id} frame {tail_frame_idx}"
+                        )
+            return meta
 
-            meta["plate_conf"] = best.conf
-            meta["plate_score"] = best.score
-            if meta.get("plate_sharp_post") is None:
-                meta["plate_sharp_post"] = preproc_result.get("sharpness")
+        meta["plate_conf"] = float(best.conf)
+        meta["plate_score"] = float(best.score)
+        meta["plate_sharp_post"] = float(best.sharpness)
+        meta["plate_frame_idx"] = int(best.frame_idx)
+        meta["plate_bbox_xyxy"] = ",".join(str(int(v)) for v in best.xyxy_full)
 
-            fine_meta = self._run_fine_crop_and_ocr(
+        frame_bgr = self._ensure_bgr(best.frame_bgr)
+        frame_h, frame_w = frame_bgr.shape[:2]
+        meta["best_frame_w"] = int(frame_w)
+        meta["best_frame_h"] = int(frame_h)
+
+        frame_dir = self.out_dir.parent / "plates_frames"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        frame_name = f"event{event_id:02d}_track{track_id}_frame{best.frame_idx:06d}.jpg"
+        frame_path = frame_dir / frame_name
+        if cv2.imwrite(str(frame_path), frame_bgr):
+            meta["best_frame_img"] = self._normalize_rel_path(Path("plates_frames") / frame_name)
+        else:
+            print(f"[plate] failed to save best frame image: {frame_path}")
+
+        tail_bgr = self._ensure_bgr(best.crop_bgr)
+        tail_name = f"event{event_id:02d}_track{track_id}_tail.jpg"
+        tail_path = self.out_dir / tail_name
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if cv2.imwrite(str(tail_path), tail_bgr):
+            meta["tail_img"] = self._normalize_rel_path(self.rel_plate_dir / tail_name)
+        else:
+            print(f"[plate] failed to save tail crop: {tail_path}")
+
+        plate_crop_bgr = self._ensure_bgr(best.plate_crop_bgr)
+        plate_name = f"event{event_id:02d}_track{track_id}_det.jpg"
+        plate_path = self.out_dir / plate_name
+        if cv2.imwrite(str(plate_path), plate_crop_bgr):
+            meta["plate_img"] = self._normalize_rel_path(self.rel_plate_dir / plate_name)
+        else:
+            print(f"[plate] failed to save coarse plate crop: {plate_path}")
+
+        print(
+            "[plate] event=%02d track=%d frame=%d bbox=%s" % (
                 event_id,
                 track_id,
-                best,
-                plate_bgr,
-                plate_focus_bgr,
-                rel_plate_path,
-                plate_path.stem,
+                best.frame_idx,
+                meta["plate_bbox_xyxy"],
             )
-            meta.update(fine_meta)
-        elif self.allow_tail_fallback and not self.only_with_plate:
-            tail_entry = self._tail_best.get(track_id)
-            if tail_entry is not None:
-                _, tail_frame_idx, tail_crop = tail_entry
-                tail_path = self.out_dir / f"event{event_id:02d}_track{track_id}_tail_best.jpg"
-                self.out_dir.mkdir(parents=True, exist_ok=True)
-                if cv2.imwrite(str(tail_path), tail_crop):
-                    tail_rel = self._normalize_rel_path(
-                        self.rel_plate_dir / tail_path.name
-                    )
-                    meta["tail_img"] = tail_rel
-                    if not meta.get("plate_ocr_img"):
-                        meta["plate_ocr_img"] = tail_rel
-                else:
-                    print(
-                        f"Failed to save tail image for track {track_id} frame {tail_frame_idx}."
-                    )
-
-        det_success = bool(meta.get("plate_det_success", False))
-        det_conf_val = meta.get("plate_det_conf")
-        if isinstance(det_conf_val, (int, float)):
-            det_conf = float(det_conf_val)
-        else:
-            det_conf = 0.0
-        ocr_conf_val = meta.get("plate_ocr_conf")
-        if isinstance(ocr_conf_val, (int, float)):
-            ocr_conf = float(ocr_conf_val)
-        else:
-            ocr_conf = 0.0
-        ocr_text = str(meta.get("plate_text", "null") or "null")
-        if not ocr_text:
-            ocr_text = "null"
-        log_img = (
-            meta.get("plate_ocr_img")
-            or meta.get("plate_img")
-            or meta.get("tail_img")
-            or ""
-        )
-        meta.pop("plate_det_success", None)
-        meta.pop("plate_det_conf", None)
-        meta.pop("plate_det_bbox", None)
-        print(
-            f"[plate] det={det_success} det_conf={det_conf:.3f} ocr={ocr_text} ocr_conf={ocr_conf:.3f} img={log_img}"
         )
 
         return meta

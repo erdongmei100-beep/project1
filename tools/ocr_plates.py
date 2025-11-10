@@ -1,366 +1,301 @@
-"""Batch OCR utility for plate crops."""
+#!/usr/bin/env python3
+"""Batch OCR pipeline for fine plate crops."""
 from __future__ import annotations
 
 import argparse
 import csv
-import inspect
-import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
-import cv2  # type: ignore
+import cv2
 import numpy as np
 
-try:  # pragma: no cover - optional dependency guard
-    from paddleocr import PaddleOCR  # type: ignore
-except Exception:  # pragma: no cover - allow fallback
-    PaddleOCR = None
+from src.plates.plate_ocr import PlateOCR, PlateOCRError
 
-try:  # pragma: no cover - optional dependency guard
-    from rapidocr_onnxruntime import RapidOCR  # type: ignore
-except Exception:  # pragma: no cover - allow fallback
-    RapidOCR = None
-
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUTS = ROOT / "data" / "outputs"
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png"}
-CSV_HEADER = [
-    "image_path",
-    "plate_text",
-    "rec_confidence",
-    "width",
-    "height",
-    "ocr_engine",
-    "used_gpu",
-    "elapsed_ms",
-]
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
 @dataclass
-class OCRResult:
+class OCRJob:
+    path: Path
     rel_path: str
-    text: str
-    confidence: float
+    name: str
+
+
+@dataclass
+class OCRRecord:
+    image_path: str
+    plate_text: str
+    rec_confidence: float
     width: int
     height: int
-    elapsed_ms: int
-
-
-def parse_bool(value: str) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+    ocr_engine: str
+    used_gpu: bool
+    elapsed_ms: float
+    ocr_img: str
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Batch OCR for fine plate crops")
+    parser = argparse.ArgumentParser(description="Recognise text on cropped plate images")
+    parser.add_argument("--input", required=True, help="Directory containing plate crops")
     parser.add_argument(
-        "--input",
-        default=None,
-        help="Directory of plate crops. Defaults to data/outputs/*/plates_fine or fallback to plates/.",
+        "--rec-model-dir",
+        default="weights/ppocr/ch_PP-OCRv4_rec_infer",
+        help="PaddleOCR recognition model directory",
     )
     parser.add_argument(
         "--engine",
         choices=["paddle", "rapid"],
         default="paddle",
-        help="OCR engine to use.",
+        help="OCR engine to use",
     )
-    parser.add_argument(
-        "--rec-model-dir",
-        default="",
-        help="PaddleOCR recognition model directory (required for paddle engine).",
-    )
-    parser.add_argument(
-        "--use-gpu",
-        default="false",
-        help="Whether to enable GPU acceleration (engine dependent).",
-    )
-    parser.add_argument(
-        "--min-height",
-        type=int,
-        default=48,
-        help="Minimum crop height for OCR processing.",
-    )
-    parser.add_argument(
-        "--min-conf",
-        type=float,
-        default=0.10,
-        help="Minimum confidence threshold to keep OCR text.",
-    )
+    parser.add_argument("--use-gpu", action="store_true", help="Enable GPU for PaddleOCR")
+    parser.add_argument("--min-conf", type=float, default=0.20, help="Minimum confidence threshold")
+    parser.add_argument("--num-workers", type=int, default=4, help="Thread count for OCR")
+    parser.add_argument("--csv", help="Optional CSV file to update with OCR results")
+    parser.add_argument("--force", action="store_true", help="Re-run OCR even if results exist")
     return parser.parse_args(argv)
 
 
-def resolve_input_dirs(input_arg: Optional[str]) -> List[Path]:
-    if input_arg:
-        path = Path(input_arg).expanduser().resolve()
-        if not path.exists() or not path.is_dir():
-            raise FileNotFoundError(f"Input directory not found: {path}")
-        return [path]
-
-    if not DEFAULT_OUTPUTS.exists():
-        return []
-
-    fine_dirs = sorted(p for p in DEFAULT_OUTPUTS.glob("*/plates_fine") if p.is_dir())
-    if fine_dirs:
-        return fine_dirs
-    plate_dirs = sorted(p for p in DEFAULT_OUTPUTS.glob("*/plates") if p.is_dir())
-    return plate_dirs
-
-
-def load_existing(csv_path: Path) -> set[str]:
-    existing: set[str] = set()
-    if not csv_path.exists():
-        return existing
-    with open(csv_path, "r", newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            rel = (row.get("image_path") or "").strip()
-            if rel:
-                existing.add(rel)
-    return existing
-
-
-def enhance_for_ocr(image_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
-    blur = cv2.GaussianBlur(enhanced, (0, 0), 0.6)
-    sharpened = cv2.addWeighted(enhanced, 1.6, blur, -0.6, 0)
-    return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
-
-
-def build_paddle_runner(rec_model_dir: str, use_gpu: bool) -> Tuple[Callable[[np.ndarray], Tuple[str, float]], str]:
-    if PaddleOCR is None:
-        raise RuntimeError("PaddleOCR is not available. Install paddleocr to use --engine paddle.")
-    if not rec_model_dir:
-        raise ValueError("--rec-model-dir is required for paddle engine")
-    model_path = Path(rec_model_dir).expanduser().resolve()
-    if not model_path.exists():
-        raise FileNotFoundError(f"PaddleOCR model directory not found: {model_path}")
-    kwargs = {
-        "det": True,
-        "rec": True,
-        "cls": False,
-        "use_angle_cls": False,
-        "rec_model_dir": str(model_path),
-        "use_gpu": use_gpu,
-    }
-    signature = inspect.signature(PaddleOCR.__init__)
-    if "lang" in signature.parameters:
-        kwargs["lang"] = "ch"
-    if "show_log" in signature.parameters:
-        kwargs["show_log"] = False
-    ocr = PaddleOCR(**kwargs)
-
-    def runner(image_bgr: np.ndarray) -> Tuple[str, float]:
-        try:
-            result = ocr.ocr(image_bgr, cls=False)
-        except Exception:
-            return "", 0.0
-        if not result:
-            return "", 0.0
-        best_text = ""
-        best_conf = 0.0
-        for item in result:
-            if not item or len(item) < 2:
-                continue
-            data = item[1]
-            if not data or len(data) < 2:
-                continue
-            text = str(data[0]).strip()
-            try:
-                conf = float(data[1])
-            except Exception:
-                conf = 0.0
-            if conf > best_conf:
-                best_conf = conf
-                best_text = text
-        return best_text, best_conf
-
-    return runner, "paddle"
-
-
-def build_rapid_runner() -> Tuple[Callable[[np.ndarray], Tuple[str, float]], str]:
-    if RapidOCR is None:
-        raise RuntimeError("RapidOCR is not available. Install rapidocr-onnxruntime to use --engine rapid.")
-    ocr = RapidOCR()
-
-    def runner(image_bgr: np.ndarray) -> Tuple[str, float]:
-        try:
-            result, _ = ocr(image_bgr)
-        except Exception:
-            return "", 0.0
-        if not result:
-            return "", 0.0
-        best_text = ""
-        best_conf = 0.0
-        for item in result:
-            if not item or len(item) < 3:
-                continue
-            text = str(item[1]).strip()
-            try:
-                conf = float(item[2])
-            except Exception:
-                conf = 0.0
-            if conf > best_conf:
-                best_conf = conf
-                best_text = text
-        return best_text, best_conf
-
-    return runner, "rapid"
-
-
-def collect_images(input_dir: Path) -> List[Path]:
-    images: List[Path] = []
+def _scan_images(input_dir: Path) -> List[OCRJob]:
+    jobs: List[OCRJob] = []
     for path in sorted(input_dir.iterdir()):
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS:
-            images.append(path)
-    return images
-
-
-def write_results(csv_path: Path, rows: Iterable[OCRResult], engine: str, use_gpu: bool) -> None:
-    rows_list = list(rows)
-    if not rows_list:
-        return
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    exists = csv_path.exists()
-    with open(csv_path, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        if not exists:
-            writer.writerow(CSV_HEADER)
-        for row in rows_list:
-            writer.writerow(
-                [
-                    row.rel_path,
-                    row.text,
-                    f"{row.confidence:.4f}",
-                    row.width,
-                    row.height,
-                    engine,
-                    "true" if use_gpu else "false",
-                    row.elapsed_ms,
-                ]
-            )
-
-
-def process_directory(
-    input_dir: Path,
-    engine_name: str,
-    rec_model_dir: str,
-    use_gpu: bool,
-    min_height: int,
-    min_conf: float,
-) -> Tuple[int, int, int, int, int]:
-    run_dir = input_dir.parent
-    csv_path = input_dir / "plate_ocr_results.csv"
-    processed_before = load_existing(csv_path)
-    images = collect_images(input_dir)
-
-    if engine_name == "paddle":
-        runner, engine_label = build_paddle_runner(rec_model_dir, use_gpu)
-    else:
-        runner, engine_label = build_rapid_runner()
-
-    results: List[OCRResult] = []
-    skipped_small = 0
-    skipped_existing = 0
-    skipped_unreadable = 0
-    skipped_conf = 0
-
-    for path in images:
-        rel_path = str(path.relative_to(run_dir))
-        if rel_path in processed_before:
-            skipped_existing += 1
+        if not path.is_file():
             continue
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if image is None or image.size == 0:
-            skipped_unreadable += 1
+        if path.suffix.lower() not in SUPPORTED_EXTS:
             continue
-        height, width = image.shape[:2]
-        if height < min_height:
-            skipped_small += 1
-            continue
-        enhanced = enhance_for_ocr(image)
-        start = time.perf_counter()
-        text, conf = runner(enhanced)
-        elapsed_ms = int(round((time.perf_counter() - start) * 1000))
-        if conf < min_conf or not text:
-            skipped_conf += 1
-            text = ""
-        results.append(
-            OCRResult(
-                rel_path=rel_path,
-                text=text,
-                confidence=conf,
-                width=width,
-                height=height,
-                elapsed_ms=elapsed_ms,
-            )
-        )
+        jobs.append(OCRJob(path=path, rel_path=path.name, name=path.name))
+    return jobs
 
-    write_results(csv_path, results, engine_label, use_gpu)
 
-    print("\n==== Plate OCR Batch Summary ====")
-    print(f"Input directory   : {input_dir}")
-    print(f"Model directory   : {rec_model_dir if rec_model_dir else '-'}")
-    print(f"OCR engine        : {engine_label}")
-    print(f"Use GPU           : {use_gpu}")
-    print(f"Total images      : {len(images)}")
-    print(f"Already processed : {skipped_existing}")
-    if skipped_small:
-        print(f"Skipped (<{min_height}px): {skipped_small}")
-    if skipped_unreadable:
-        print(f"Skipped (unreadable): {skipped_unreadable}")
-    if skipped_conf:
-        print(f"Below min-conf     : {skipped_conf}")
-    newly_processed = len(results)
-    print(f"Newly processed   : {newly_processed}")
-    print("================================\n")
+def _load_csv(csv_path: Path) -> tuple[List[Dict[str, str]], List[str]]:
+    rows: List[Dict[str, str]] = []
+    with csv_path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        header = list(reader.fieldnames or [])
+        for row in reader:
+            rows.append(dict(row))
+    return rows, header
 
-    return (
-        len(images),
-        skipped_existing,
-        skipped_small,
-        skipped_unreadable,
-        newly_processed,
+
+def _save_csv(csv_path: Path, rows: List[Dict[str, str]], header: List[str]) -> None:
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _load_existing_results(results_path: Path) -> Dict[str, Dict[str, str]]:
+    if not results_path.exists():
+        return {}
+    with results_path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        return {row["image_path"]: dict(row) for row in reader if row.get("image_path")}
+
+
+def _normalise_path(path: Path) -> str:
+    return path.as_posix()
+
+
+def _draw_annotation(
+    image: np.ndarray, text: str, conf: float, points: Optional[List[List[float]]]
+) -> np.ndarray:
+    annotated = image.copy()
+    if points:
+        pts = [(int(round(p[0])), int(round(p[1]))) for p in points]
+        if len(pts) >= 4:
+            cv2.polylines(annotated, [np.array(pts, dtype=int)], isClosed=True, color=(0, 255, 255), thickness=2)
+    label = text if text else "<empty>"
+    cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 32), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        annotated,
+        f"{label} | {conf:.2f}",
+        (8, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
     )
+    return annotated
+
+
+def _match_rows(rows: List[Dict[str, str]]) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    for idx, row in enumerate(rows):
+        for key in ("fine_img", "plate_img", "tail_img"):
+            value = row.get(key, "").strip()
+            if not value:
+                continue
+            name = Path(value).name
+            if name and name not in mapping:
+                mapping[name] = idx
+    return mapping
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    input_dir = Path(args.input).expanduser().resolve()
+    if not input_dir.exists() or not input_dir.is_dir():
+        raise FileNotFoundError(f"输入目录不存在: {input_dir}")
+
+    base_root = input_dir.parent
     try:
-        input_dirs = resolve_input_dirs(args.input)
-    except Exception as exc:
-        print(exc)
-        return 1
+        input_prefix = input_dir.relative_to(base_root)
+    except ValueError:
+        input_prefix = Path(input_dir.name)
 
-    if not input_dirs:
-        print("No plate directories found. Use --input to specify a directory explicitly.")
-        return 1
+    jobs = _scan_images(input_dir)
+    if not jobs:
+        print("未找到可处理的图片。")
+        return 0
 
-    use_gpu = parse_bool(args.use_gpu)
-    total_processed = 0
-    total_new = 0
-    for directory in input_dirs:
-        try:
-            stats = process_directory(
-                directory,
-                engine_name=args.engine,
-                rec_model_dir=args.rec_model_dir,
-                use_gpu=use_gpu,
-                min_height=int(args.min_height),
-                min_conf=float(args.min_conf),
+    try:
+        ocr = PlateOCR(
+            engine=args.engine,
+            use_gpu=args.use_gpu,
+            rec_model_dir=args.rec_model_dir if args.engine == "paddle" else None,
+            min_conf=args.min_conf,
+        )
+    except PlateOCRError as exc:
+        raise SystemExit(str(exc))
+
+    ocr_dir = input_dir / "ocr"
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    results_path = input_dir / "plate_ocr_results.csv"
+    existing_results = {} if args.force else _load_existing_results(results_path)
+
+    csv_rows: List[Dict[str, str]] = []
+    csv_header: List[str] = []
+    row_mapping: Dict[str, int] = {}
+    if args.csv:
+        csv_path = Path(args.csv).expanduser().resolve()
+        if not csv_path.exists():
+            raise FileNotFoundError(f"CSV 文件不存在: {csv_path}")
+        csv_rows, csv_header = _load_csv(csv_path)
+        row_mapping = _match_rows(csv_rows)
+    else:
+        csv_path = None
+
+    processed_records: Dict[str, OCRRecord] = {}
+
+    def submit(job: OCRJob) -> Optional[OCRRecord]:
+        image_key = _normalise_path(input_prefix / job.rel_path)
+        if not args.force and image_key in existing_results:
+            previous = existing_results[image_key]
+            if (previous.get("plate_text") or "").strip():
+                print(f"[SKIP] {job.rel_path} 已有结果")
+                return None
+        image = cv2.imread(str(job.path), cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            print(f"[WARN] 无法读取图片: {job.path}")
+            return OCRRecord(
+                image_path=job.rel_path,
+                plate_text="",
+                rec_confidence=0.0,
+                width=0,
+                height=0,
+                ocr_engine=args.engine,
+                used_gpu=args.use_gpu,
+                elapsed_ms=0.0,
+                ocr_img="",
             )
-        except Exception as exc:
-            print(f"Failed to process {directory}: {exc}")
-            continue
-        total_processed += stats[0]
-        total_new += stats[-1]
+        result = ocr(image)
+        text = result.get("text", "").strip()
+        conf = float(result.get("conf", 0.0))
+        points = result.get("points")
+        elapsed = float(result.get("elapsed_ms", 0.0))
+        if conf < args.min_conf:
+            text = ""
+        annotated = _draw_annotation(image, text, conf, points)
+        ocr_rel = input_prefix / "ocr" / f"{job.path.stem}_ocr.jpg"
+        ocr_path = ocr_dir / f"{job.path.stem}_ocr.jpg"
+        cv2.imwrite(str(ocr_path), annotated)
+        width, height = int(image.shape[1]), int(image.shape[0])
+        return OCRRecord(
+            image_path=image_key,
+            plate_text=text,
+            rec_confidence=conf,
+            width=width,
+            height=height,
+            ocr_engine=args.engine,
+            used_gpu=args.use_gpu,
+            elapsed_ms=elapsed,
+            ocr_img=_normalise_path(ocr_rel),
+        )
 
-    if total_new == 0:
-        print("No new images were processed. Adjust thresholds or check input paths if needed.")
+    with ThreadPoolExecutor(max_workers=max(1, args.num_workers)) as executor:
+        future_map = {executor.submit(submit, job): job for job in jobs}
+        for future in as_completed(future_map):
+            job = future_map[future]
+            try:
+                record = future.result()
+            except Exception as exc:
+                print(f"[WARN] OCR 异常 {job.rel_path}: {exc}")
+                continue
+            if record is None:
+                continue
+            processed_records[record.image_path] = record
+            print(
+                f"[OK] {job.rel_path} text='{record.plate_text}' conf={record.rec_confidence:.3f}"
+            )
+            if csv_rows:
+                basename = job.name
+                if basename in row_mapping:
+                    row = csv_rows[row_mapping[basename]]
+                    row["plate_text"] = record.plate_text
+                    row["plate_ocr_conf"] = f"{record.rec_confidence:.6f}"
+                    row["plate_ocr_img"] = record.ocr_img
+
+    combined = existing_results
+    for rec in processed_records.values():
+        combined[rec.image_path] = {
+            "image_path": rec.image_path,
+            "plate_text": rec.plate_text,
+            "rec_confidence": f"{rec.rec_confidence:.6f}",
+            "width": str(rec.width),
+            "height": str(rec.height),
+            "ocr_engine": rec.ocr_engine,
+            "used_gpu": "true" if rec.used_gpu else "false",
+            "elapsed_ms": f"{rec.elapsed_ms:.2f}",
+            "ocr_img": rec.ocr_img,
+        }
+
+    if combined:
+        fieldnames = [
+            "image_path",
+            "plate_text",
+            "rec_confidence",
+            "width",
+            "height",
+            "ocr_engine",
+            "used_gpu",
+            "elapsed_ms",
+            "ocr_img",
+        ]
+        with results_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for key in sorted(combined.keys()):
+                writer.writerow(combined[key])
+
+    if csv_rows and csv_path is not None:
+        if csv_header:
+            if "plate_text" not in csv_header:
+                csv_header.append("plate_text")
+            for extra in ["plate_ocr_conf", "plate_ocr_img"]:
+                if extra not in csv_header:
+                    csv_header.append(extra)
+        else:
+            csv_header = ["plate_text", "plate_ocr_conf", "plate_ocr_img"]
+        _save_csv(csv_path, csv_rows, csv_header)
+
+    print(f"完成 OCR，共处理 {len(processed_records)} 张图片。")
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

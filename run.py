@@ -245,6 +245,12 @@ def export_events(
                     "plate_sharp_post": meta.get("plate_sharp_post"),
                     "plate_ocr_conf": meta.get("plate_ocr_conf"),
                     "plate_ocr_img": meta.get("plate_ocr_img", ""),
+                    "fine_img": meta.get("fine_img", ""),
+                    "plate_bbox_xyxy": meta.get("plate_bbox_xyxy", ""),
+                    "best_frame_img": meta.get("best_frame_img", ""),
+                    "best_frame_w": meta.get("best_frame_w"),
+                    "best_frame_h": meta.get("best_frame_h"),
+                    "plate_frame_idx": meta.get("plate_frame_idx"),
                 }
             )
         rows.append(row)
@@ -259,6 +265,12 @@ def export_events(
             "plate_sharp_post",
             "plate_ocr_conf",
             "plate_ocr_img",
+            "fine_img",
+            "plate_bbox_xyxy",
+            "best_frame_img",
+            "best_frame_w",
+            "best_frame_h",
+            "plate_frame_idx",
         ]:
             if column not in df.columns:
                 df[column] = None
@@ -1014,11 +1026,17 @@ def main() -> None:
             "plate_img": "",
             "plate_conf": None,
             "plate_score": None,
-            "plate_text": "null",
+            "plate_text": "",
             "tail_img": "",
             "plate_sharp_post": None,
-            "plate_ocr_conf": None,
+            "plate_ocr_conf": 0.0,
             "plate_ocr_img": "",
+            "fine_img": "",
+            "plate_bbox_xyxy": "",
+            "best_frame_img": "",
+            "best_frame_w": 0,
+            "best_frame_h": 0,
+            "plate_frame_idx": -1,
         }
 
     try:
