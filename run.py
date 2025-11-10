@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -723,6 +725,7 @@ def main() -> None:
 
     plate_metadata: List[Dict[str, object]] = []
     collector = None
+    plates_out_dir: Optional[Path] = None
     plate_weights_path: Optional[Path] = None
     frame_plate_detector = None
     frame_plate_ocr = None
@@ -1375,6 +1378,86 @@ def main() -> None:
             clip_post_seconds,
             clip_subdir,
         )
+
+    if plate_enabled and plates_out_dir is not None:
+        tail_images = sorted(
+            p for p in plates_out_dir.glob("*_tail.*") if p.is_file()
+        )
+        if not tail_images:
+            print("[plate-lpr] 未找到车辆裁剪图，跳过 YOLOv5+HyperLPR 流程。")
+        else:
+            vehicle_crop_dir = plates_out_dir / "vehicle_roi"
+            vehicle_crop_dir.mkdir(parents=True, exist_ok=True)
+            for src in tail_images:
+                dest = vehicle_crop_dir / src.name
+                try:
+                    if not dest.exists() or src.stat().st_mtime > dest.stat().st_mtime:
+                        shutil.copy2(src, dest)
+                except Exception as exc:
+                    print(f"[plate-lpr] 同步车辆裁剪 {src.name} 失败: {exc}")
+
+            lp_cfg_section = dict(plate_cfg.get("lp_pipeline") or {})
+
+            def _lp_value(key: str, default):
+                val = lp_cfg_section.get(key)
+                if val is None:
+                    val = plate_cfg.get(key)
+                return default if val is None else val
+
+            out_dir_raw = _lp_value("out_dir", "runs/plates")
+            yolo_weights_raw = _lp_value("yolo_weights", "weights/plate_best.pt")
+            img_size_val = int(_lp_value("img_size", 640))
+            conf_val = float(_lp_value("conf_thres", 0.25))
+            iou_val = float(_lp_value("iou_thres", 0.45))
+            expand_val = float(_lp_value("expand_ratio", 0.10))
+            save_candidates_val = bool(_lp_value("save_candidates", True))
+            use_hub_val = bool(_lp_value("use_hub", True))
+            download_url_val = _lp_value("download_url", None)
+
+            out_dir_path = resolve_path(ROOT, str(out_dir_raw))
+            weights_path_candidate = resolve_path(ROOT, str(yolo_weights_raw))
+            weights_exists = weights_path_candidate.exists()
+            if not weights_exists:
+                if use_hub_val:
+                    print(
+                        "[plate-lpr] 车牌检测权重缺失: "
+                        f"{weights_path_candidate}。将尝试通过 PyTorch Hub 加载。"
+                    )
+                else:
+                    resolved_url = download_url_val or os.getenv("PLATE_YOLOV5_URL")
+                    if not resolved_url:
+                        print(
+                            "[plate-lpr] 车牌检测权重缺失: "
+                            f"{weights_path_candidate}。将尝试自动下载默认 YOLOv5 权重。"
+                        )
+                    else:
+                        print(
+                            "[plate-lpr] 车牌检测权重缺失: "
+                            f"{weights_path_candidate}。将尝试从 {resolved_url} 下载。"
+                        )
+            try:
+                from modules.lp_pipeline import process_vehicle_folder
+            except Exception as exc:
+                print(f"[plate-lpr] 无法导入车牌识别流水线: {exc}")
+            else:
+                try:
+                    results_csv = process_vehicle_folder(
+                        vehicle_dir=str(vehicle_crop_dir),
+                        out_dir=str(out_dir_path),
+                        yolo_weights=str(weights_path_candidate),
+                        img_size=img_size_val,
+                        conf_thres=conf_val,
+                        iou_thres=iou_val,
+                        expand_ratio=expand_val,
+                        save_candidates=save_candidates_val,
+                        use_hub=use_hub_val,
+                        download_url=download_url_val,
+                    )
+                    print(f"[plate-lpr] 车牌识别完成: {results_csv}")
+                except RuntimeError as exc:
+                    print(f"[plate-lpr] YOLOv5+HyperLPR 流程失败: {exc}")
+                except Exception as exc:
+                    print(f"[plate-lpr] 执行 YOLOv5+HyperLPR 流程时出错: {exc}")
 
 
 if __name__ == "__main__":

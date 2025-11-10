@@ -87,6 +87,30 @@ python tools/ocr_plates.py \
 
 若终端摘要显示存在“低于置信度阈值”的图片，可适当降低 `--min-conf` 后重新运行。
 
+### YOLOv5 车牌检测 + HyperLPR 识别
+
+车辆裁剪阶段会在 `data/outputs/<run_name>/plates/` 下生成 `*_tail.jpg` 车辆 ROI。可使用新增脚本完成车牌检测、精确裁剪与 HyperLPR 识别：
+
+```bash
+python tools/run_plate_ocr.py \
+  --vehicle_dir data/outputs/<run_name>/plates/vehicle_roi \
+  --yolo_weights weights/plate_best.pt \
+  --out_dir runs/plates \
+  --download_url https://github.com/ultralytics/yolov5/releases/download/v6.0/yolov5n.pt
+```
+
+如需手动准备权重，可将下载好的 `*.pt` 文件放到仓库根目录下的 `weights/plate_best.pt`（或在配置中的 `plate.lp_pipeline.yolo_weights` 指定新的路径）。脚本也会在本地模式下自动创建目录并把在线下载的权重写入同一位置，方便后续离线复用。
+
+> 📦 **关于 YOLOv5 本地模式：** `weights/plate_best.pt` 只需要模型权重文件本身，不要把整个 YOLOv5 仓库解压到 `weights/`。若想使用 `--use_hub 0`，请把解压后的 `ultralytics-yolov5-*/` 内容拷贝到仓库根目录的 `yolov5/` 文件夹（保持 `models/、utils/` 等子目录结构），而权重文件仍应单独放在 `weights/plate_best.pt`。
+
+脚本会自动同步已有 `*_tail.jpg` 至 `vehicle_roi/` 子目录。默认通过 PyTorch Hub 加载 YOLOv5；如需使用本地 `yolov5/`，可追加 `--use_hub 0`。当本地权重缺失时，脚本会自动按 `--download_url`（留空则使用默认链接，亦可通过环境变量 `PLATE_YOLOV5_URL` 覆盖）下载模型并保存到指定路径。
+
+执行后会生成：
+
+- `runs/plates/results.csv`
+- `runs/plates/*_vis.jpg`
+- `runs/plates/*_cand{i}.jpg`
+
 ## 运行示例
 
 - Windows
@@ -129,6 +153,7 @@ python run.py \
 ## 常见问题
 
 - **缺少依赖**：运行脚本会在导入失败时提示“请先运行 setup 脚本或 pip install -r requirements.txt”。
+- **RapidOCR 初次运行报错 `Cannot load model ... huggingface_hub is not installed`**：这是 `rapidocr-onnxruntime` 在下载 ONNX 检测/识别模型时未检测到 `huggingface_hub`。按提示执行 `pip install huggingface_hub` 或重新运行 `setup_env` 即可补齐依赖。
 - **输出位置**：所有视频、剪辑、截图与 CSV 均保存在 `data/outputs/`，可安全清理或忽略。
 - **重新运行**：删除 `data/outputs/<视频名>/` 下的旧结果后再执行 `run.py` 即可重新生成。
 - **仓库默认状态**：为保持仓库整洁，`data/outputs/` 仅保留 `.gitkeep` 占位文件；实际运行时会重新生成所需的 CSV、可视化视频、叠加图等产物。
