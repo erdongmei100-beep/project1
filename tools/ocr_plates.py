@@ -274,43 +274,50 @@ def _match_rows(rows: List[Dict[str, str]]) -> Dict[str, int]:
     return mapping
 
 
-def _validate_paddle_model_dir(model_dir: Path) -> Tuple[bool, List[str]]:
-    missing: List[str] = []
-    if not model_dir.exists():
-        missing = list(_REQUIRED_PADDLE_FILES)
-        return False, missing
+def _validate_paddle_model_dir(model_dir: Path) -> Tuple[bool, List[Path], bool]:
+    missing: List[Path] = []
+    exists = model_dir.exists() and model_dir.is_dir()
+    if not exists:
+        missing.extend(model_dir / filename for filename in _REQUIRED_PADDLE_FILES)
+        return False, missing, False
     for filename in _REQUIRED_PADDLE_FILES:
         target = model_dir / filename
         if not target.is_file():
-            missing.append(filename)
-    return len(missing) == 0, missing
+            missing.append(target)
+    return len(missing) == 0, missing, True
 
 
-def _resolve_engine(requested_engine: str, model_dir: Path) -> Tuple[str, Optional[str], Optional[str]]:
+def _resolve_engine(
+    requested_engine: str, model_dir: Path
+) -> Tuple[str, Optional[List[Path]], Optional[str]]:
     """Resolve OCR engine considering auto fallback and model availability."""
 
     engine = requested_engine.lower()
-    fallback_reason: Optional[str] = None
+    fallback_missing: Optional[List[Path]] = None
     error_message: Optional[str] = None
 
     if engine == "auto":
-        ok, missing = _validate_paddle_model_dir(model_dir)
+        ok, missing, exists = _validate_paddle_model_dir(model_dir)
         if ok:
             engine = "paddle"
         else:
-            fallback_reason = ", ".join(missing)
+            fallback_missing = missing
             engine = "rapid"
     elif engine == "paddle":
-        ok, missing = _validate_paddle_model_dir(model_dir)
+        ok, missing, exists = _validate_paddle_model_dir(model_dir)
         if not ok:
-            missing_str = ", ".join(missing)
+            missing_paths = "\n  ".join(str(path) for path in missing)
+            suggestion = (
+                "请从 https://github.com/PaddlePaddle/PaddleOCR/releases 下载官方 inference 模型并解压至该目录"
+            )
+            if not exists:
+                suggestion += "，或检查目录路径是否正确"
             error_message = (
                 f"PaddleOCR 模型目录不完整: {model_dir}\n"
-                f"缺少以下文件: {missing_str}\n"
-                "请从 https://github.com/PaddlePaddle/PaddleOCR/releases 下载官方 inference 模型并解压至该目录，"
-                "或使用 --engine rapid"
+                f"缺少以下文件:\n  {missing_paths}\n"
+                f"{suggestion}，或使用 --engine rapid"
             )
-    return engine, fallback_reason, error_message
+    return engine, fallback_missing, error_message
 
 
 def _print_param_overview(
@@ -375,10 +382,11 @@ def _run_self_test() -> int:
             "--dry-run",
         ])
         assert ns3.engine == "auto"
-        ok, missing = _validate_paddle_model_dir(tmp_path)
-        assert not ok and set(missing) == set(_REQUIRED_PADDLE_FILES)
-        resolved, fallback_reason, error_msg = _resolve_engine("auto", tmp_path)
-        assert resolved == "rapid" and fallback_reason
+        ok, missing, exists = _validate_paddle_model_dir(tmp_path)
+        assert not ok and exists
+        assert {path.name for path in missing} == set(_REQUIRED_PADDLE_FILES)
+        resolved, fallback_missing, error_msg = _resolve_engine("auto", tmp_path)
+        assert resolved == "rapid" and fallback_missing
         assert error_msg is None
     print("self-test OK")
     return 0
@@ -404,15 +412,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rec_model_dir = Path(args.rec_model_dir).expanduser().resolve()
 
     requested_engine = args.engine.lower()
-    engine, fallback_reason, error_message = _resolve_engine(requested_engine, rec_model_dir)
+    engine, fallback_missing, error_message = _resolve_engine(requested_engine, rec_model_dir)
     if error_message:
         print(error_message)
         return 2
-    if requested_engine == "auto" and engine == "rapid" and fallback_reason:
-        print(
-            "[WARN] PaddleOCR 模型缺失，自动降级到 RapidOCR。缺少: "
-            f"{fallback_reason}"
+    if requested_engine == "auto" and engine == "rapid" and fallback_missing:
+        missing_lines = "\n  ".join(str(path) for path in fallback_missing)
+        warning = (
+            "[WARN] PaddleOCR 模型缺失，自动降级到 RapidOCR。缺少以下文件:\n  "
+            f"{missing_lines}"
         )
+        print(warning)
 
     base_root = input_dir.parent
     try:
@@ -579,7 +589,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     elapsed_s = time.perf_counter() - start_time
 
-    if not args.dry_run and processed_records:
+    if not args.dry_run:
         combined = dict(existing_results)
         for rec in processed_records.values():
             combined[rec.image_path] = {
@@ -593,22 +603,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "elapsed_ms": f"{rec.elapsed_ms:.2f}",
                 "ocr_img": rec.ocr_img,
             }
-        fieldnames = [
-            "image_path",
-            "plate_text",
-            "rec_confidence",
-            "width",
-            "height",
-            "ocr_engine",
-            "used_gpu",
-            "elapsed_ms",
-            "ocr_img",
-        ]
-        with results_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            for key in sorted(combined.keys()):
-                writer.writerow(combined[key])
+        if combined:
+            fieldnames = [
+                "image_path",
+                "plate_text",
+                "rec_confidence",
+                "width",
+                "height",
+                "ocr_engine",
+                "used_gpu",
+                "elapsed_ms",
+                "ocr_img",
+            ]
+            with results_path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                for key in sorted(combined.keys()):
+                    writer.writerow(combined[key])
 
     if not args.dry_run and csv_rows and csv_path is not None:
         if csv_header:
@@ -622,7 +633,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _save_csv(csv_path, csv_rows, csv_header)
 
     print("\n处理摘要:")
-    print(f"  OCR 引擎: {engine}")
+    print(f"  ocr_engine: {engine}")
     print(f"  使用 GPU: {'true' if args.use_gpu else 'false'}")
     print(f"  dry_run: {'true' if args.dry_run else 'false'}")
     print(f"  总计图片: {stats['total']}")
@@ -635,8 +646,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"  新增结果: {stats['new_results']}")
     print(f"  低置信过滤: {stats['low_conf']}")
     print(f"  错误计数: {stats['errors']}")
-    if fallback_reason:
-        print(f"  引擎降级: rapid (缺少 {fallback_reason})")
+    if fallback_missing:
+        missing_summary = ", ".join(path.name for path in fallback_missing)
+        print(f"  引擎降级: rapid (缺少 {missing_summary})")
     print(f"  总耗时: {elapsed_s:.2f}s")
 
     if args.dry_run:
