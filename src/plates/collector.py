@@ -13,6 +13,7 @@ from src.utils.paths import OUTPUTS_DIR, WEIGHTS_DIR
 from src.ocr import PlateOCR
 
 from .detector import PlateDetector as CandidatePlateDetector
+from .fine_crop import crop_by_xyxy, ensure_xyxy_int, expand_with_margin
 from .plate_det import PlateDetector as FinePlateDetector
 from .preprocess import enhance_plate
 from .quality import (
@@ -84,11 +85,13 @@ class VehicleFilter:
 class PlateCandidate:
     frame_idx: int
     xyxy_full: List[int]
+    xyxy_crop: List[int]
     conf: float
     rel_area: float
     sharpness: float
     score: float
     crop_bgr: np.ndarray
+    plate_crop_bgr: np.ndarray
     roi_flag: Optional[bool] = None
 
 
@@ -100,6 +103,8 @@ class PlateCollector:
         cfg_plate: dict,
         out_dir: Path | None,
         detector: Optional[PlateDetector] = None,
+        fine_detector: Optional[FinePlateDetector] = None,
+        plate_ocr: Optional[PlateOCR] = None,
         video_fps: Optional[float] = None,
         cam_id: Optional[str] = None,
     ) -> None:
@@ -140,38 +145,68 @@ class PlateCollector:
 
         self.save_fine_plate = bool(self.cfg.get("save_fine_plate", True))
         self.save_gray_plate = bool(self.cfg.get("save_gray_plate", False))
+        self.fine_mode = str(self.cfg.get("fine_crop_mode", "reuse_bbox")).lower()
+        if self.fine_mode not in {"reuse_bbox", "redetect"}:
+            self.fine_mode = "reuse_bbox"
+        self.fine_margin = float(
+            self.cfg.get("plate_crop_margin", self.cfg.get("plate_margin", 0.12))
+        )
+        self.fine_area_fail_ratio = float(self.cfg.get("plate_crop_area_fail_ratio", 0.92))
         self.rel_plate_dir = Path("plates")
         self.rel_fine_dir = Path("plates_fine")
         self.fine_out_dir = self.out_dir.parent / self.rel_fine_dir
         if self.save_fine_plate:
             self.fine_out_dir.mkdir(parents=True, exist_ok=True)
 
-        self.fine_detector: Optional[FinePlateDetector] = fine_detector
-        if self.fine_detector is None:
-            fine_weights_cfg = self.cfg.get("plate_det_weights")
-            fine_weights = (
-                Path(str(fine_weights_cfg))
-                if fine_weights_cfg
-                else WEIGHTS_DIR / "plate" / "yolov8n-plate.pt"
-            )
-            fine_conf = float(self.cfg.get("plate_det_conf", 0.25))
-            fine_imgsz = int(self.cfg.get("plate_det_imgsz", 640))
-            fine_margin = float(self.cfg.get("plate_margin", 0.25))
-            try:
-                self.fine_detector = FinePlateDetector(
-                    weights=str(fine_weights),
-                    conf=fine_conf,
-                    imgsz=fine_imgsz,
-                    margin=fine_margin,
+        self.fine_detector: Optional[FinePlateDetector] = None
+        if self.fine_mode == "redetect":
+            self.fine_detector = fine_detector
+            if self.fine_detector is None:
+                fine_weights_cfg = self.cfg.get("plate_crop_weights") or self.cfg.get("plate_det_weights")
+                fine_weights = (
+                    Path(str(fine_weights_cfg))
+                    if fine_weights_cfg
+                    else WEIGHTS_DIR / "plate" / "yolov8n-plate.pt"
                 )
-            except Exception as exc:
-                print(f"[plate] Fine detector unavailable; continuing without fine crop: {exc}")
-                self.fine_detector = None
+                fine_conf = float(
+                    self.cfg.get("plate_crop_conf", self.cfg.get("plate_det_conf", 0.2))
+                )
+                fine_imgsz = int(
+                    self.cfg.get("plate_crop_imgsz", self.cfg.get("plate_det_imgsz", 960))
+                )
+                try:
+                    self.fine_detector = FinePlateDetector(
+                        weights=str(fine_weights),
+                        conf=fine_conf,
+                        imgsz=fine_imgsz,
+                        margin=self.fine_margin,
+                        device=str(self.cfg.get("device", "cpu")),
+                    )
+                except Exception as exc:
+                    print(
+                        f"[plate] Fine detector unavailable; continuing without fine crop: {exc}"
+                    )
+                    self.fine_detector = None
 
         self.plate_ocr: Optional[PlateOCR] = plate_ocr
         if self.plate_ocr is None:
+            ocr_engine = str(self.cfg.get("ocr_engine", "rapidocr"))
+            ocr_model_dir = self.cfg.get("ocr_model_dir")
             try:
-                self.plate_ocr = PlateOCR(min_conf=float(self.cfg.get("ocr_conf_min", 0.15)))
+                self.plate_ocr = PlateOCR(
+                    engine=ocr_engine,
+                    min_conf=float(self.cfg.get("ocr_conf_min", 0.15)),
+                    lang=self.cfg.get("ocr_lang", "ch"),
+                    det=bool(self.cfg.get("ocr_det", False)),
+                    rec=bool(self.cfg.get("ocr_rec", True)),
+                    use_angle_cls=bool(self.cfg.get("ocr_use_angle_cls", False)),
+                    ocr_model_dir=str(ocr_model_dir) if ocr_model_dir else None,
+                    use_gpu=bool(self.cfg.get("ocr_use_gpu", False)),
+                    min_height=int(self.cfg.get("ocr_min_height", 96)),
+                    write_empty=bool(self.cfg.get("ocr_write_empty", True)),
+                    log_csv_path="",
+                    crops_dir="",
+                )
             except Exception as exc:
                 print(f"[plate] Plate OCR unavailable; continuing without OCR: {exc}")
                 self.plate_ocr = None
@@ -210,6 +245,7 @@ class PlateCollector:
         if crop_info is None:
             return None
         crop_bgr, crop_x1, crop_y1 = crop_info
+        crop_context = crop_bgr.copy()
 
         car_area = (car_xyxy_full[2] - car_xyxy_full[0]) * (car_xyxy_full[3] - car_xyxy_full[1])
         if car_area <= 0:
@@ -225,6 +261,7 @@ class PlateCollector:
 
         detections = self.detector.detect(crop_bgr)
         if not detections:
+            print(f"[plate] no detection at frame {frame_idx}")
             return self._best_candidate.get(track_id)
 
         best_for_track = self._best_candidate.get(track_id)
@@ -263,11 +300,13 @@ class PlateCollector:
             candidate = PlateCandidate(
                 frame_idx=frame_idx,
                 xyxy_full=full_xyxy,
+                xyxy_crop=[px1_i, py1_i, px2_i, py2_i],
                 conf=conf,
                 rel_area=rel_area,
                 sharpness=sharpness,
                 score=score,
-                crop_bgr=plate_crop.copy(),
+                crop_bgr=crop_context,
+                plate_crop_bgr=plate_crop.copy(),
                 roi_flag=roi_flag,
             )
             self._candidates.setdefault(track_id, []).append(candidate)
@@ -298,22 +337,26 @@ class PlateCollector:
             "plate_text": "null",
             "tail_img": "",
             "plate_sharp_post": None,
-            "plate_ocr_conf": None,
+            "plate_ocr_conf": 0.0,
             "plate_ocr_img": "",
+            "plate_det_conf": None,
+            "plate_det_success": False,
         }
 
         candidates = list(self._candidates.get(track_id, []))
         best = self._select_candidate(track_id, candidates, start_frame)
         if best is not None:
+            plate_focus_bgr = best.plate_crop_bgr if hasattr(best, "plate_crop_bgr") else best.crop_bgr
             try:
-                preproc_result = enhance_plate(best.crop_bgr, self.preproc_cfg, None)
+                preproc_result = enhance_plate(plate_focus_bgr, self.preproc_cfg, None)
             except Exception:
                 preproc_result = {
-                    "final": best.crop_bgr.copy(),
+                    "final": plate_focus_bgr.copy(),
                     "stages": {},
-                    "sharpness": laplacian_var(best.crop_bgr),
+                    "sharpness": laplacian_var(plate_focus_bgr),
                 }
 
+            plate_focus_bgr = self._ensure_bgr(plate_focus_bgr)
             plate_bgr = self._ensure_bgr(best.crop_bgr)
             plate_path = self.out_dir / f"event{event_id:02d}_track{track_id}_best.jpg"
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -336,7 +379,9 @@ class PlateCollector:
             fine_meta = self._run_fine_crop_and_ocr(
                 event_id,
                 track_id,
+                best,
                 plate_bgr,
+                plate_focus_bgr,
                 rel_plate_path,
                 plate_path.stem,
             )
@@ -348,11 +393,43 @@ class PlateCollector:
                 tail_path = self.out_dir / f"event{event_id:02d}_track{track_id}_tail_best.jpg"
                 self.out_dir.mkdir(parents=True, exist_ok=True)
                 if cv2.imwrite(str(tail_path), tail_crop):
-                    meta["tail_img"] = str(Path("plates") / tail_path.name)
+                    tail_rel = self._normalize_rel_path(
+                        self.rel_plate_dir / tail_path.name
+                    )
+                    meta["tail_img"] = tail_rel
+                    if not meta.get("plate_ocr_img"):
+                        meta["plate_ocr_img"] = tail_rel
                 else:
                     print(
                         f"Failed to save tail image for track {track_id} frame {tail_frame_idx}."
                     )
+
+        det_success = bool(meta.get("plate_det_success", False))
+        det_conf_val = meta.get("plate_det_conf")
+        if isinstance(det_conf_val, (int, float)):
+            det_conf = float(det_conf_val)
+        else:
+            det_conf = 0.0
+        ocr_conf_val = meta.get("plate_ocr_conf")
+        if isinstance(ocr_conf_val, (int, float)):
+            ocr_conf = float(ocr_conf_val)
+        else:
+            ocr_conf = 0.0
+        ocr_text = str(meta.get("plate_text", "null") or "null")
+        if not ocr_text:
+            ocr_text = "null"
+        log_img = (
+            meta.get("plate_ocr_img")
+            or meta.get("plate_img")
+            or meta.get("tail_img")
+            or ""
+        )
+        meta.pop("plate_det_success", None)
+        meta.pop("plate_det_conf", None)
+        meta.pop("plate_det_bbox", None)
+        print(
+            f"[plate] det={det_success} det_conf={det_conf:.3f} ocr={ocr_text} ocr_conf={ocr_conf:.3f} img={log_img}"
+        )
 
         return meta
 
@@ -360,7 +437,9 @@ class PlateCollector:
         self,
         event_id: int,
         track_id: int,
+        candidate: PlateCandidate,
         plate_bgr: np.ndarray,
+        fallback_plate_bgr: np.ndarray,
         plate_rel_path: str,
         plate_name_stem: str,
     ) -> Dict[str, object]:
@@ -368,69 +447,147 @@ class PlateCollector:
             "plate_text": "null",
             "plate_ocr_conf": 0.0,
             "plate_ocr_img": plate_rel_path,
+            "plate_det_conf": 0.0,
+            "plate_det_success": False,
         }
 
-        if plate_bgr is None or plate_bgr.size == 0:
+        base_plate = plate_bgr if plate_bgr is not None and plate_bgr.size > 0 else None
+        fallback_crop = (
+            fallback_plate_bgr if fallback_plate_bgr is not None and fallback_plate_bgr.size > 0 else None
+        )
+        if base_plate is None:
+            base_plate = fallback_crop
+        if base_plate is None:
             return result
 
-        crop_bgr = plate_bgr
-        det_conf: Optional[float] = None
-        det_failed = True
+        crop_for_ocr = fallback_crop if fallback_crop is not None else base_plate
+        det_conf: float = 0.0
+        det_bbox: Optional[Tuple[int, int, int, int]] = None
+        det_success = False
         ocr_image_rel = plate_rel_path
 
-        if self.fine_detector is not None:
+        raw_bbox: Optional[Tuple[int, int, int, int]] = None
+        if getattr(candidate, "xyxy_crop", None):
             try:
-                fine_result = self.fine_detector.fine_crop(plate_bgr)
+                raw_bbox = ensure_xyxy_int(candidate.xyxy_crop)
+            except Exception:
+                raw_bbox = None
+
+        fine_crop: Optional[np.ndarray] = None
+
+        if self.fine_mode == "reuse_bbox" and raw_bbox is not None:
+            height, width = base_plate.shape[:2]
+            det_bbox = expand_with_margin(raw_bbox, self.fine_margin, width, height)
+            fine_crop = crop_by_xyxy(base_plate, det_bbox)
+            if fine_crop is not None and fine_crop.size > 0:
+                det_bbox_valid: Optional[Tuple[int, int, int, int]] = det_bbox
+                plate_area = max(width * height, 1)
+                det_area = max((det_bbox[2] - det_bbox[0]) * (det_bbox[3] - det_bbox[1]), 1)
+                area_ratio = det_area / float(plate_area)
+                if area_ratio >= self.fine_area_fail_ratio:
+                    det_bbox_raw = expand_with_margin(raw_bbox, 0.0, width, height)
+                    raw_area = max(
+                        (det_bbox_raw[2] - det_bbox_raw[0]) * (det_bbox_raw[3] - det_bbox_raw[1]),
+                        1,
+                    )
+                    raw_ratio = raw_area / float(plate_area)
+                    if raw_ratio < self.fine_area_fail_ratio:
+                        det_bbox_valid = det_bbox_raw
+                    else:
+                        det_bbox_valid = None
+                if det_bbox_valid is not None:
+                    det_bbox = det_bbox_valid
+                    fine_crop = crop_by_xyxy(base_plate, det_bbox)
+                else:
+                    print(
+                        f"[plate] event={event_id:02d} track={track_id} fine crop bbox ratio>=threshold"
+                    )
+                    det_bbox = None
+                    fine_crop = None
+                    if fallback_crop is not None and fallback_crop.size > 0:
+                        fine_crop = fallback_crop
+            if fine_crop is not None and fine_crop.size > 0:
+                det_success = True
+                det_conf = float(candidate.conf)
+                crop_for_ocr = fine_crop
+        elif self.fine_mode == "redetect" and self.fine_detector is not None:
+            try:
+                fine_result = self.fine_detector.fine_crop(base_plate)
             except Exception as exc:
                 print(
                     f"[plate] event={event_id:02d} track={track_id} fine crop error: {exc}"
                 )
                 fine_result = None
+
             if fine_result is not None:
-                crop_bgr, _, det_conf = fine_result
-                det_failed = False
-                if self.save_fine_plate:
-                    fine_name = f"{plate_name_stem}_plate.jpg"
-                    fine_path = self.fine_out_dir / fine_name
-                    if cv2.imwrite(str(fine_path), crop_bgr):
-                        ocr_image_rel = self._normalize_rel_path(
-                            self.rel_fine_dir / fine_name
-                        )
-                    else:
-                        ocr_image_rel = plate_rel_path
-                        print(f"[plate] Failed to save fine plate image: {fine_path}")
+                crop_candidate, det_bbox, det_conf = fine_result
+                plate_h, plate_w = base_plate.shape[:2]
+                det_w = max(det_bbox[2] - det_bbox[0], 1)
+                det_h = max(det_bbox[3] - det_bbox[1], 1)
+                det_area = det_w * det_h
+                plate_area = max(plate_h * plate_w, 1)
+                area_ratio = det_area / float(plate_area)
+                if area_ratio >= self.fine_area_fail_ratio and fallback_crop is not None:
+                    print(
+                        "[plate] fine crop bbox ~full image; fallback to primary plate crop"
+                    )
+                    det_bbox = None
+                    det_conf = 0.0
                 else:
-                    ocr_image_rel = plate_rel_path
+                    fine_crop = crop_candidate
+                    crop_for_ocr = crop_candidate
+                    det_success = True
+
+            if not det_success and raw_bbox is not None:
+                height, width = base_plate.shape[:2]
+                det_bbox = expand_with_margin(raw_bbox, self.fine_margin, width, height)
+                fine_crop = crop_by_xyxy(base_plate, det_bbox)
+                if fine_crop is not None and fine_crop.size > 0:
+                    det_conf = float(candidate.conf)
+                    det_success = True
+                    crop_for_ocr = fine_crop
+
+            if not det_success and plate_rel_path:
+                print(
+                    f"[plate] event={event_id:02d} track={track_id} fine crop det_fail"
+                )
+        elif self.fine_mode == "redetect" and self.fine_detector is None and raw_bbox is not None:
+            height, width = base_plate.shape[:2]
+            det_bbox = expand_with_margin(raw_bbox, self.fine_margin, width, height)
+            fine_crop = crop_by_xyxy(base_plate, det_bbox)
+            if fine_crop is not None and fine_crop.size > 0:
+                det_success = True
+                det_conf = float(candidate.conf)
+                crop_for_ocr = fine_crop
+
+        if det_success and fine_crop is not None and fine_crop.size > 0:
+            if self.save_fine_plate:
+                fine_name = f"{plate_name_stem}_plate.jpg"
+                fine_path = self.fine_out_dir / fine_name
+                if cv2.imwrite(str(fine_path), fine_crop):
+                    ocr_image_rel = self._normalize_rel_path(self.rel_fine_dir / fine_name)
+                else:
+                    print(f"[plate] Failed to save fine plate image: {fine_path}")
 
         if self.plate_ocr is None:
-            if det_conf is not None:
-                print(
-                    f"[plate] event={event_id:02d} track={track_id} det_conf={det_conf:.3f} OCR disabled"
-                )
-            else:
-                print(
-                    f"[plate] event={event_id:02d} track={track_id} det_fail OCR disabled"
-                )
             result["plate_ocr_img"] = ocr_image_rel
+            result["plate_det_conf"] = det_conf
+            result["plate_det_success"] = det_success
+            if det_bbox is not None:
+                result["plate_det_bbox"] = det_bbox
             return result
 
-        text, conf = self.plate_ocr.read(crop_bgr)
+        text, conf = self.plate_ocr.read(crop_for_ocr)
         if not text:
             text = "null"
 
         result["plate_text"] = text
         result["plate_ocr_conf"] = conf
         result["plate_ocr_img"] = ocr_image_rel
-
-        log_path = ocr_image_rel or plate_rel_path or ""
-        if det_failed:
-            print(
-                f"[plate] event={event_id:02d} track={track_id} det_fail ocr_conf={conf:.3f} text={text} path={log_path}"
-            )
-        else:
-            print(
-                f"[plate] event={event_id:02d} track={track_id} det_conf={det_conf:.3f} ocr_conf={conf:.3f} text={text} path={log_path}"
-            )
+        result["plate_det_conf"] = det_conf
+        result["plate_det_success"] = det_success
+        if det_bbox is not None:
+            result["plate_det_bbox"] = det_bbox
 
         return result
 
@@ -492,10 +649,9 @@ class PlateCollector:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             return
-        filename = (
-            f"track{track_id}_f{frame_idx}_s{candidate.score:.3f}.jpg"
-        )
-        cv2.imwrite(str(self.debug_dir / filename), candidate.crop_bgr)
+        filename = f"track{track_id}_f{frame_idx}_s{candidate.score:.3f}.jpg"
+        crop = candidate.plate_crop_bgr if hasattr(candidate, "plate_crop_bgr") else candidate.crop_bgr
+        cv2.imwrite(str(self.debug_dir / filename), crop)
 
     # >>> 修改开始: 预处理调试图拼接
     def _save_preproc_debug(

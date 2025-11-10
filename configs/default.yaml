@@ -81,6 +81,11 @@ plate:
   pick_mode: entry
   entry_window_frames: 15
   per_track: true
+  plate_crop_imgsz: 960
+  plate_crop_conf: 0.20
+  plate_crop_margin: 0.12
+  fine_crop_mode: reuse_bbox
+  plate_crop_area_fail_ratio: 0.92
   preproc:
     enable: true
     upscale_min_side: 320
@@ -94,13 +99,16 @@ plate:
     binarize: false
     save_debug: false
 
-plate_det_weights: weights/plate/yolov8n-plate.pt
-plate_det_conf: 0.25
-plate_det_imgsz: 640
-plate_margin: 0.25
-
 ocr_engine: rapidocr
 ocr_conf_min: 0.15
 
 save_fine_plate: true
 save_gray_plate: false
+
+plate_weights: weights/plate/yolov8n-plate.pt
+plate_enabled: true
+plate_crop_imgsz: 960
+plate_crop_conf: 0.20
+plate_crop_margin: 0.12
+fine_crop_mode: reuse_bbox
+plate_crop_area_fail_ratio: 0.92
