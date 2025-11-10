@@ -21,11 +21,13 @@ class PlateDetector:
         conf: float = 0.25,
         imgsz: int = 640,
         margin: float = 0.25,
+        device: str = "cpu",
     ) -> None:
         self.weights = Path(weights)
         self.conf = float(conf)
         self.imgsz = int(imgsz)
         self.margin = float(margin)
+        self.device = str(device or "cpu")
         self._model: Optional[YOLO] = None
         self._load_model()
 
@@ -46,18 +48,14 @@ class PlateDetector:
     def _clip(self, x1: int, y1: int, x2: int, y2: int, width: int, height: int) -> Tuple[int, int, int, int]:
         dx = int((x2 - x1) * self.margin)
         dy = int((y2 - y1) * self.margin)
-        x1 -= dx
-        x2 += dx
-        y1 -= dy
-        y2 += dy
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(width - 1, x2)
-        y2 = min(height - 1, y2)
+        x1 = max(0, x1 - dx)
+        x2 = min(width, x2 + dx)
+        y1 = max(0, y1 - dy)
+        y2 = min(height, y2 + dy)
         if x2 <= x1:
-            x2 = min(width - 1, x1 + 1)
+            x2 = min(width, x1 + 1)
         if y2 <= y1:
-            y2 = min(height - 1, y1 + 1)
+            y2 = min(height, y1 + 1)
         return x1, y1, x2, y2
 
     def fine_crop(self, img_bgr: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], float]]:
@@ -72,7 +70,7 @@ class PlateDetector:
                 imgsz=self.imgsz,
                 conf=self.conf,
                 verbose=False,
-                device="cpu",
+                device=self.device,
             )[0]
         except Exception as exc:
             print(f"[plate] Fine crop prediction failed: {exc}")

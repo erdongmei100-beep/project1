@@ -100,6 +100,8 @@ class PlateCollector:
         cfg_plate: dict,
         out_dir: Path | None,
         detector: Optional[PlateDetector] = None,
+        fine_detector: Optional[FinePlateDetector] = None,
+        plate_ocr: Optional[PlateOCR] = None,
         video_fps: Optional[float] = None,
         cam_id: Optional[str] = None,
     ) -> None:
@@ -148,21 +150,28 @@ class PlateCollector:
 
         self.fine_detector: Optional[FinePlateDetector] = fine_detector
         if self.fine_detector is None:
-            fine_weights_cfg = self.cfg.get("plate_det_weights")
+            fine_weights_cfg = self.cfg.get("plate_crop_weights") or self.cfg.get("plate_det_weights")
             fine_weights = (
                 Path(str(fine_weights_cfg))
                 if fine_weights_cfg
                 else WEIGHTS_DIR / "plate" / "yolov8n-plate.pt"
             )
-            fine_conf = float(self.cfg.get("plate_det_conf", 0.25))
-            fine_imgsz = int(self.cfg.get("plate_det_imgsz", 640))
-            fine_margin = float(self.cfg.get("plate_margin", 0.25))
+            fine_conf = float(
+                self.cfg.get("plate_crop_conf", self.cfg.get("plate_det_conf", 0.25))
+            )
+            fine_imgsz = int(
+                self.cfg.get("plate_crop_imgsz", self.cfg.get("plate_det_imgsz", 640))
+            )
+            fine_margin = float(
+                self.cfg.get("plate_crop_margin", self.cfg.get("plate_margin", 0.25))
+            )
             try:
                 self.fine_detector = FinePlateDetector(
                     weights=str(fine_weights),
                     conf=fine_conf,
                     imgsz=fine_imgsz,
                     margin=fine_margin,
+                    device=str(self.cfg.get("device", "cpu")),
                 )
             except Exception as exc:
                 print(f"[plate] Fine detector unavailable; continuing without fine crop: {exc}")
@@ -225,6 +234,7 @@ class PlateCollector:
 
         detections = self.detector.detect(crop_bgr)
         if not detections:
+            print(f"[plate] no detection at frame {frame_idx}")
             return self._best_candidate.get(track_id)
 
         best_for_track = self._best_candidate.get(track_id)
@@ -298,8 +308,10 @@ class PlateCollector:
             "plate_text": "null",
             "tail_img": "",
             "plate_sharp_post": None,
-            "plate_ocr_conf": None,
+            "plate_ocr_conf": 0.0,
             "plate_ocr_img": "",
+            "plate_det_conf": None,
+            "plate_det_success": False,
         }
 
         candidates = list(self._candidates.get(track_id, []))
@@ -354,6 +366,33 @@ class PlateCollector:
                         f"Failed to save tail image for track {track_id} frame {tail_frame_idx}."
                     )
 
+        det_success = bool(meta.get("plate_det_success", False))
+        det_conf_val = meta.get("plate_det_conf")
+        if isinstance(det_conf_val, (int, float)):
+            det_conf = float(det_conf_val)
+        else:
+            det_conf = 0.0
+        ocr_conf_val = meta.get("plate_ocr_conf")
+        if isinstance(ocr_conf_val, (int, float)):
+            ocr_conf = float(ocr_conf_val)
+        else:
+            ocr_conf = 0.0
+        ocr_text = str(meta.get("plate_text", "null") or "null")
+        if not ocr_text:
+            ocr_text = "null"
+        log_img = (
+            meta.get("plate_ocr_img")
+            or meta.get("plate_img")
+            or meta.get("tail_img")
+            or ""
+        )
+        meta.pop("plate_det_success", None)
+        meta.pop("plate_det_conf", None)
+        meta.pop("plate_det_bbox", None)
+        print(
+            f"[plate] det={det_success} det_conf={det_conf:.3f} ocr={ocr_text} ocr_conf={ocr_conf:.3f} img={log_img}"
+        )
+
         return meta
 
     def _run_fine_crop_and_ocr(
@@ -368,6 +407,8 @@ class PlateCollector:
             "plate_text": "null",
             "plate_ocr_conf": 0.0,
             "plate_ocr_img": plate_rel_path,
+            "plate_det_conf": None,
+            "plate_det_success": False,
         }
 
         if plate_bgr is None or plate_bgr.size == 0:
@@ -377,6 +418,7 @@ class PlateCollector:
         det_conf: Optional[float] = None
         det_failed = True
         ocr_image_rel = plate_rel_path
+        det_bbox: Optional[Tuple[int, int, int, int]] = None
 
         if self.fine_detector is not None:
             try:
@@ -387,7 +429,7 @@ class PlateCollector:
                 )
                 fine_result = None
             if fine_result is not None:
-                crop_bgr, _, det_conf = fine_result
+                crop_bgr, det_bbox, det_conf = fine_result
                 det_failed = False
                 if self.save_fine_plate:
                     fine_name = f"{plate_name_stem}_plate.jpg"
@@ -403,15 +445,9 @@ class PlateCollector:
                     ocr_image_rel = plate_rel_path
 
         if self.plate_ocr is None:
-            if det_conf is not None:
-                print(
-                    f"[plate] event={event_id:02d} track={track_id} det_conf={det_conf:.3f} OCR disabled"
-                )
-            else:
-                print(
-                    f"[plate] event={event_id:02d} track={track_id} det_fail OCR disabled"
-                )
             result["plate_ocr_img"] = ocr_image_rel
+            result["plate_det_conf"] = det_conf
+            result["plate_det_success"] = not det_failed
             return result
 
         text, conf = self.plate_ocr.read(crop_bgr)
@@ -421,16 +457,10 @@ class PlateCollector:
         result["plate_text"] = text
         result["plate_ocr_conf"] = conf
         result["plate_ocr_img"] = ocr_image_rel
-
-        log_path = ocr_image_rel or plate_rel_path or ""
-        if det_failed:
-            print(
-                f"[plate] event={event_id:02d} track={track_id} det_fail ocr_conf={conf:.3f} text={text} path={log_path}"
-            )
-        else:
-            print(
-                f"[plate] event={event_id:02d} track={track_id} det_conf={det_conf:.3f} ocr_conf={conf:.3f} text={text} path={log_path}"
-            )
+        result["plate_det_conf"] = det_conf
+        result["plate_det_success"] = not det_failed
+        if det_bbox is not None:
+            result["plate_det_bbox"] = det_bbox
 
         return result
 
