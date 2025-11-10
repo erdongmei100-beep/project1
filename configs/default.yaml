@@ -8,7 +8,7 @@ tracking:
   max_det: 1000
   tracker_config: configs/tracker/bytetrack.yaml
 ocr:
-  enable: true
+  enable: false
   apply_on: crop
   use_gpu: false
   rec_model_dir: weights/ppocr/ch_PP-OCRv4_rec_infer

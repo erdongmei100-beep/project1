@@ -54,6 +54,37 @@
 
 如未安装或版本不匹配，车牌 OCR 初始化会给出明确错误提示。
 
+### 批量车牌 OCR 使用说明
+
+视频推理阶段默认只导出车牌裁剪图，不再实时做 OCR。需要进行批量识别时，请执行独立脚本：
+
+```bash
+python tools/ocr_plates.py \
+  --input data/outputs/<run_name>/plates \
+  --rec-model-dir weights/ppocr/ch_PP-OCRv4_rec_infer \
+  --use-gpu false \
+  --min-height 64 \
+  --min-conf 0.20 \
+  --num-workers 4 \
+  --dry-run false
+```
+
+参数说明：
+
+- `--input`：必填，指向 `data/outputs/<run_name>/plates/` 目录，脚本会递归遍历其中的裁剪图。
+- `--rec-model-dir`：PaddleOCR 识别模型目录，需至少包含 `inference.pdmodel` 与 `inference.pdiparams`。如缺少 `inference.json` 等元数据，会打印一次 WARN 并继续。
+- `--use-gpu`：如环境已安装 GPU 版 Paddle，可设为 `true`；默认 CPU（`false`）。
+- `--min-height`：像素高度阈值，小于该值的裁剪图直接跳过。
+- `--min-conf`：置信度阈值，识别分数低于该值时文本置空但仍保留记录。
+- `--num-workers`：并行线程数，用于加速批量识别。
+- `--dry-run`：设为 `true` 时仅统计将要处理的图像数量，不写入 CSV、不执行 OCR。
+
+脚本会在 `plates/` 目录下生成（或增量更新）`plate_ocr_results.csv`，列顺序固定为：
+
+`image_path, plate_text, rec_confidence, width, height, ocr_engine, used_gpu, elapsed_ms`
+
+其中 `image_path` 为仓库根目录的相对路径；若识别置信度不足或失败，`plate_text` 为空字符串、`rec_confidence` 记录原始分数（无分数时记 0.0）。脚本具备幂等性，已写入 CSV 的图像不会重复处理；若裁剪图尺寸任一边大于 512 像素，会被安全跳过以防误将整帧送入 OCR。
+
 ## 运行示例
 
 - Windows
