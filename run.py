@@ -423,53 +423,24 @@ def _crop_with_padding(frame: np.ndarray, bbox: Tuple[float, float, float, float
     return frame[y_min:y_max, x_min:x_max].copy()
 
 
-def save_plate_crop(
-    frame: np.ndarray,
-    bbox_xyxy: Tuple[int, int, int, int],
-    ocr: Optional[Any] = None,
-    min_conf: float = 0.20,
-    crops_dir: Union[str, Path] = "runs/plates/crops",
-    timestamp: Optional[int] = None,
-    track_id: Optional[Union[int, str]] = None,
-    cam_id: Optional[str] = None,
-    roi_flag: Optional[bool] = None,
-    frame_idx: Optional[int] = None,
-    identifier: Optional[Union[int, str]] = None,
-    **_: Any,
-) -> Tuple[str, str, float]:
-    import os
-    import time as _time
-
+def save_plate_crop(frame, bbox_xyxy, ocr=None, min_conf=0.25,
+                    crops_dir="runs/plates/crops",
+                    timestamp=None, track_id=None, cam_id=None, roi_flag=None):
+    import os, time, uuid, cv2
+    os.makedirs(crops_dir, exist_ok=True)
     x1, y1, x2, y2 = map(int, bbox_xyxy)
-    frame_h, frame_w = frame.shape[:2]
-    x1 = max(0, min(x1, frame_w))
-    y1 = max(0, min(y1, frame_h))
-    x2 = max(0, min(x2, frame_w))
-    y2 = max(0, min(y2, frame_h))
-    if x2 <= x1 or y2 <= y1:
-        return "", "", 0.0
-
     crop = frame[y1:y2, x1:x2]
-    if getattr(crop, "size", 0) == 0:
-        return "", "", 0.0
 
-    ts = int(_time.time()) if timestamp is None else int(timestamp)
-    tid = (
-        str(track_id)
-        if track_id is not None
-        else (str(identifier) if identifier is not None else uuid.uuid4().hex[:8])
-    )
-    crops_dir_str = str(crops_dir)
-    os.makedirs(crops_dir_str, exist_ok=True)
-    out_path = os.path.join(crops_dir_str, f"{ts}_t{tid}.jpg")
-    if not cv2.imwrite(out_path, crop):
-        return "", "", 0.0
+    ts = int(time.time()) if timestamp is None else int(timestamp)
+    tid = "t" + (str(track_id) if track_id is not None else str(uuid.uuid4())[:8])
+    out_path = os.path.join(crops_dir, f"{ts}_{tid}.jpg")
+    cv2.imwrite(out_path, crop)
 
     plate_text, plate_conf = "", 0.0
     if ocr is not None:
-        text, conf = ocr.recognize_crop(crop)
-        if conf >= float(min_conf):
-            plate_text, plate_conf = text, float(conf)
+        t, c = ocr.recognize_crop(crop)
+        if c >= float(min_conf):
+            plate_text, plate_conf = t, c
 
     return out_path, plate_text, plate_conf
 
@@ -938,8 +909,6 @@ def main() -> None:
                         track_id=crop_identifier,
                         cam_id=frame_plate_cam_id,
                         roi_flag=roi_flag,
-                        frame_idx=frame_idx,
-                        identifier=crop_identifier,
                     )
 
                     if (

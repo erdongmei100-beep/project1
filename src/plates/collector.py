@@ -6,7 +6,6 @@ import math
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -341,6 +340,7 @@ class PlateCollector:
                 best.xyxy_full,
                 best.frame_idx,
                 best.roi_flag,
+                track_id,
             )
             plate_path = self.out_dir / f"event{event_id:02d}_track{track_id}_best.jpg"
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -479,21 +479,25 @@ class PlateCollector:
             )
 
     def _save_ocr_crop_image(
-        self, crop_bgr: np.ndarray, text: str, frame_idx: int
-    ) -> str:
+        self, crop_bgr: np.ndarray, timestamp: Optional[int] = None, track_id: Optional[str] = None
+    ) -> Tuple[str, str, float]:
         if self.plate_ocr is None:
-            return ""
-        crops_dir = Path(self.plate_ocr.crops_dir)
-        crops_dir.mkdir(parents=True, exist_ok=True)
-        identifier = "".join(ch for ch in text if ch.isalnum()) if text else ""
-        if not identifier:
-            identifier = "plate"
-        timestamp_label = datetime.now().strftime("%Y%m%d%H%M%S%f")
-        filename = f"{timestamp_label}_f{frame_idx}_{identifier}.jpg"
-        crop_path = crops_dir / filename
-        if cv2.imwrite(str(crop_path), crop_bgr):
-            return str(crop_path)
-        return ""
+            return "", "", 0.0
+        import os, time, uuid, cv2
+
+        crops_dir = str(self.plate_ocr.crops_dir or "runs/plates/crops")
+        os.makedirs(crops_dir, exist_ok=True)
+        ts = int(time.time()) if timestamp is None else int(timestamp)
+        tid = "t" + (str(track_id) if track_id is not None else str(uuid.uuid4())[:8])
+        out_path = os.path.join(crops_dir, f"{ts}_{tid}.jpg")
+        cv2.imwrite(out_path, crop_bgr)
+
+        plate_text, plate_conf = "", 0.0
+        t, c = self.plate_ocr.recognize_crop(crop_bgr)
+        if c >= float(self.plate_ocr.min_conf):
+            plate_text, plate_conf = t, c
+
+        return out_path, plate_text, plate_conf
 
     def _frame_to_time_ms(self, frame_idx: int) -> Optional[int]:
         if self.video_fps and self.video_fps > 0:
@@ -506,6 +510,7 @@ class PlateCollector:
         bbox_xyxy: List[int],
         frame_idx: int,
         roi_flag: Optional[bool],
+        track_id: Optional[int] = None,
     ) -> Optional[Dict[str, object]]:
         if self.plate_ocr is None:
             return None
@@ -522,21 +527,17 @@ class PlateCollector:
             return None
         try:
             video_time_ms = self._frame_to_time_ms(frame_idx)
-            raw_text, raw_conf = self.plate_ocr.recognize_crop(crop_bgr)
-            conf = float(raw_conf)
-            text = raw_text
-            reason = ""
-            if not text:
-                reason = "no_text"
-            if conf < self.plate_ocr.min_conf:
-                if text:
-                    reason = "low_conf"
-                text = ""
-                conf = 0.0
-
+            text = ""
+            conf = 0.0
             image_path = ""
-            if self.ocr_save_crop:
-                image_path = self._save_ocr_crop_image(crop_bgr, raw_text, frame_idx)
+            attempted = bool(self.ocr_save_crop)
+            if attempted:
+                image_path, text, conf = self._save_ocr_crop_image(
+                    crop_bgr,
+                    timestamp=video_time_ms,
+                    track_id=str(track_id) if track_id is not None else None,
+                )
+            reason = "" if text else ("no_text" if attempted else "")
 
             self._log_plate_result(
                 bbox_tuple,
@@ -549,7 +550,7 @@ class PlateCollector:
                 reason,
             )
 
-            if not text and reason:
+            if attempted and not text and reason:
                 print(
                     f"[OCR empty] frame={frame_idx} reason={reason} box={bbox_tuple}"
                 )

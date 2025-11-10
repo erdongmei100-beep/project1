@@ -9,12 +9,12 @@ tracking:
   tracker_config: configs/tracker/bytetrack.yaml
 ocr:
   enable: true
-  apply_on: crop         # 只在裁剪图上做 OCR
+  apply_on: crop
   use_gpu: false
-  rec_model_dir: weights/ppocr/ch_PP-OCRv4_rec_infer  # 本地 PaddleOCR 识别模型目录
-  min_height: 64        # 车牌裁剪最小高度像素
-  write_empty: true     # 即便识别为空也写CSV
-  min_conf: 0.20        # 低置信度也暂时写入
+  rec_model_dir: weights/ppocr/ch_PP-OCRv4_rec_infer
+  min_height: 96
+  min_conf: 0.25
+  write_empty: false      # ← 避免没有识别到文本时写空记录
 
 detect:
   plate_imgsz: 1280     # 车牌检测推理尺寸
