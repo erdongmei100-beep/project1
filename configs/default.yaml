@@ -15,11 +15,11 @@ detect:
 
 roi:
   enable: true  # 是否启用 ROI 裁剪逻辑
-  mode: manual  # manual=使用已有 JSON，auto_cv=根据视频自动估计
+  mode: auto_cv  # manual=使用已有 JSON，auto_cv=根据视频自动估计
   dir: data/rois
   path: ""  # 兼容旧配置，若提供则覆盖 dir 推导的路径
   device: cuda  # 自动 ROI 推理默认优先使用 GPU，可自动回退 CPU
-  laneaf:
+    laneaf:        # LaneAF 推理配置，pull 后若缺失请复制此小节
     enable: true              # 启用 LaneAF 作为应急车道 ROI 推理
     weights: weights/laneaf_culane.pth  # 需提前下载的 LaneAF 权重
     device: cuda              # LaneAF 推理设备，自动回退 CPU

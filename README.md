@@ -153,6 +153,7 @@ python -m project.tools.roi_auto_cv \
 
 `configs/default.yaml` 中新增 `roi.laneaf` 配置段，可通过 LaneAF 车道检测网络生成更稳定的应急车道区域。
 
+> 若从旧版本升级后在 `configs/default.yaml` 中没有看到 LaneAF 小节，可直接复制 `configs/roi_laneaf_example.yaml` 中的示例覆盖到自己使用的配置文件内。
 - `enable`: 是否启用 LaneAF。若初始化失败会自动回退到旧版 auto_cv 算法。
 - `weights`: 预训练权重路径，需提前下载官方 `laneaf_culane.pth` 等模型并放入仓库。
 - `device`: 推理设备，默认 `cuda`，可自动降级为 `cpu`。

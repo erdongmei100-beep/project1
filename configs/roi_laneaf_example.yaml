@@ -1,0 +1,14 @@
+roi:
+  laneaf:
+    enable: true
+    weights: weights/laneaf_culane.pth
+    device: cuda
+    confidence: 0.35
+    min_points: 6
+    bottom_ratio: 0.35
+    min_lane_height_ratio: 0.45
+    min_bottom_span_px: 20.0
+    target_lane_index_from_right: 1
+    simplify_step: 2
+    right_margin_px: 0
+    fallback_to_rightmost: true
