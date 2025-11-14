@@ -1,4 +1,4 @@
-"""Plate crop enhancement pipeline for OCR readiness."""
+"""Plate crop enhancement pipeline."""
 from __future__ import annotations
 
 from typing import Any, Dict, Optional

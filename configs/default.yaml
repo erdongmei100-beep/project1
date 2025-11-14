@@ -7,15 +7,6 @@ tracking:
   iou: 0.45
   max_det: 1000
   tracker_config: configs/tracker/bytetrack.yaml
-ocr:
-  enable: false
-  apply_on: crop
-  use_gpu: false
-  rec_model_dir: weights/ppocr/ch_PP-OCRv4_rec_infer
-  min_height: 96
-  min_conf: 0.25
-  write_empty: false      # ← 避免没有识别到文本时写空记录
-
 detect:
   plate_imgsz: 1280     # 车牌检测推理尺寸
   use_sahi: true        # 大分辨率时启用切片推理
@@ -99,10 +90,6 @@ plate:
     binarize: false
     save_debug: false
 
-ocr_engine: paddle
-ocr_min_conf: 0.20
-ocr_use_gpu: false
-ocr_rec_model_dir: weights/ppocr/ch_PP-OCRv4_rec_infer
 plate_crop_margin: 0.12
 plate_crop_min_height: 64
 plate_crop_redetect: false
@@ -110,9 +97,6 @@ plate_crop_imgsz: 640
 plate_aspect_min: 2.0
 plate_aspect_max: 5.0
 debug_draw: false
-
-# Backward compatibility keys used by legacy components
-ocr_conf_min: 0.20
 
 save_fine_plate: true
 save_gray_plate: false

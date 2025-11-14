@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import os
-import shutil
-import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -242,12 +238,12 @@ def export_events(
                     "plate_img": meta.get("plate_img", ""),
                     "plate_conf": meta.get("plate_conf"),
                     "plate_score": meta.get("plate_score"),
-                    "plate_text": meta.get("plate_text"),
                     "tail_img": meta.get("tail_img", ""),
                     "plate_sharp_post": meta.get("plate_sharp_post"),
-                    "plate_ocr_conf": meta.get("plate_ocr_conf"),
-                    "plate_ocr_img": meta.get("plate_ocr_img", ""),
                     "fine_img": meta.get("fine_img", ""),
+                    "plate_det_conf": meta.get("plate_det_conf"),
+                    "plate_det_bbox": meta.get("plate_det_bbox", ""),
+                    "plate_det_success": meta.get("plate_det_success"),
                     "plate_bbox_xyxy": meta.get("plate_bbox_xyxy", ""),
                     "best_frame_img": meta.get("best_frame_img", ""),
                     "best_frame_w": meta.get("best_frame_w"),
@@ -262,12 +258,12 @@ def export_events(
             "plate_img",
             "plate_conf",
             "plate_score",
-            "plate_text",
             "tail_img",
             "plate_sharp_post",
-            "plate_ocr_conf",
-            "plate_ocr_img",
             "fine_img",
+            "plate_det_conf",
+            "plate_det_bbox",
+            "plate_det_success",
             "plate_bbox_xyxy",
             "best_frame_img",
             "best_frame_w",
@@ -463,30 +459,6 @@ def _crop_with_padding(frame: np.ndarray, bbox: Tuple[float, float, float, float
     if x_max <= x_min or y_max <= y_min:
         return None
     return frame[y_min:y_max, x_min:x_max].copy()
-
-
-def save_plate_crop(frame, bbox_xyxy, ocr=None, min_conf=0.25,
-                    crops_dir="runs/plates/crops",
-                    timestamp=None, track_id=None, cam_id=None, roi_flag=None):
-    import os, time, uuid, cv2
-    os.makedirs(crops_dir, exist_ok=True)
-    x1, y1, x2, y2 = map(int, bbox_xyxy)
-    crop = frame[y1:y2, x1:x2]
-
-    ts = int(time.time()) if timestamp is None else int(timestamp)
-    tid = "t" + (str(track_id) if track_id is not None else str(uuid.uuid4())[:8])
-    out_path = os.path.join(crops_dir, f"{ts}_{tid}.jpg")
-    cv2.imwrite(out_path, crop)
-
-    plate_text, plate_conf = "", 0.0
-    if ocr is not None:
-        t, c = ocr.recognize_crop(crop)
-        if c >= float(min_conf):
-            plate_text, plate_conf = t, c
-
-    return out_path, plate_text, plate_conf
-
-
 def export_plate_crops(
     events: List[OccupancyEvent],
     metadata: VideoMetadata,
@@ -695,8 +667,6 @@ def main() -> None:
 
     print(f"Output base directory: {video_output_dir}")
 
-    detect_cfg = dict(config.get("detect", {}) or {})
-    ocr_cfg_global = dict(config.get("ocr", {}) or {})
     plate_cfg = dict(config.get("plate", {}) or {})
     if "enable" in plate_cfg and "enabled" not in plate_cfg:
         plate_cfg.setdefault("enabled", plate_cfg.get("enable"))
@@ -727,22 +697,6 @@ def main() -> None:
     collector = None
     plates_out_dir: Optional[Path] = None
     plate_weights_path: Optional[Path] = None
-    frame_plate_detector = None
-    frame_plate_ocr = None
-    frame_plate_cam_id: Optional[str] = None
-    frame_plate_runtime_enabled = False
-    ocr_save_crop = bool(ocr_cfg_global.get("save_crop", True))
-    ocr_min_conf = float(ocr_cfg_global.get("min_conf", 0.25))
-    ocr_log_csv_cfg = ocr_cfg_global.get("log_csv_path") or "runs/plates/plate_logs.csv"
-    ocr_log_csv_path = resolve_path(ROOT, str(ocr_log_csv_cfg))
-    ocr_crops_dir_cfg = ocr_cfg_global.get("crops_dir") or "runs/plates/crops"
-    ocr_crops_dir = resolve_path(ROOT, str(ocr_crops_dir_cfg))
-    if ocr_save_crop:
-        ocr_crops_dir.mkdir(parents=True, exist_ok=True)
-    ocr_warn_printed = False
-    ocr_model_dir_cfg = ocr_cfg_global.get("rec_model_dir") or ocr_cfg_global.get("ocr_model_dir")
-    ocr_use_gpu = bool(ocr_cfg_global.get("use_gpu", False))
-    ocr_apply_on = str(ocr_cfg_global.get("apply_on", "crop")).lower()
 
     def _resolve_plate_weights(strict: bool = False) -> Optional[Path]:
         nonlocal plate_weights_path
@@ -758,67 +712,6 @@ def main() -> None:
                 raise
         return plate_weights_path
 
-    if bool(ocr_cfg_global.get("enable", True)):
-        try:
-            from src.detect.plate_detector import PlateDetector as FramePlateDetector
-
-            if plate_weights_path is None:
-                plate_weights_path = _resolve_plate_weights(strict=True)
-            if plate_weights_path is None:
-                raise FileNotFoundError("Plate weights unavailable for OCR pipeline")
-            frame_plate_detector = FramePlateDetector(
-                weights=str(plate_weights_path),
-                imgsz=int(detect_cfg.get("plate_imgsz", 1280)),
-                use_sahi=bool(detect_cfg.get("use_sahi", True)),
-                tile_size=int(detect_cfg.get("tile_size", 1024)),
-                tile_overlap=float(detect_cfg.get("tile_overlap", 0.2)),
-                device=str(plate_cfg.get("device", "")),
-            )
-            if ocr_apply_on == "crop":
-                try:
-                    from src.ocr.plate_ocr import PlateOCR as FramePlateOCR
-
-                    frame_plate_ocr = FramePlateOCR(
-                        lang=str(ocr_cfg_global.get("lang", "ch")),
-                        det=bool(ocr_cfg_global.get("det", False)),
-                        rec=bool(ocr_cfg_global.get("rec", True)),
-                        use_angle_cls=bool(ocr_cfg_global.get("use_angle_cls", False)),
-                        ocr_model_dir=str(ocr_model_dir_cfg) if ocr_model_dir_cfg else None,
-                        use_gpu=ocr_use_gpu,
-                        log_csv_path=str(ocr_log_csv_path),
-                        crops_dir=str(ocr_crops_dir),
-                        min_height=int(ocr_cfg_global.get("min_height", 96)),
-                        write_empty=bool(ocr_cfg_global.get("write_empty", True)),
-                        min_conf=float(ocr_cfg_global.get("min_conf", 0.25)),
-                        engine=str(
-                            config.get("ocr_engine")
-                            or ocr_cfg_global.get("engine")
-                            or "rapidocr"
-                        ),
-                    )
-                    print(f"[OCR] Using local rec model: {ocr_model_dir_cfg}")
-                except Exception as exc:
-                    print("\n==== OCR 初始化失败（不会联网下载）====")
-                    print(str(exc))
-                    print("====================================\n")
-                    frame_plate_ocr = None
-            cam_id_cfg = ocr_cfg_global.get("cam_id")
-            if cam_id_cfg is not None:
-                frame_plate_cam_id = str(cam_id_cfg)
-            else:
-                try:
-                    frame_plate_cam_id = (
-                        Path(metadata.path).stem if getattr(metadata, "path", None) else source_path.stem
-                    )
-                except Exception:
-                    frame_plate_cam_id = source_path.stem
-            frame_plate_runtime_enabled = frame_plate_detector is not None
-        except Exception as exc:
-            print(f"Frame plate OCR pipeline unavailable: {exc}")
-            frame_plate_detector = None
-            frame_plate_ocr = None
-            frame_plate_runtime_enabled = False
-
     plate_every_n_frames = max(int(plate_cfg.get("every_n_frames", 1)), 1)
     vehicle_filter = VehicleFilter(
         plate_cfg.get("classes_allow"),
@@ -831,7 +724,6 @@ def main() -> None:
         from src.plates.collector import PlateCollector
         from src.plates.detector import PlateDetector as CandidatePlateDetector
         from src.plates.plate_det import PlateDetector as FinePlateDetector
-        from src.ocr.plate_ocr import PlateOCR
 
         plate_dirname = str(output_cfg.get("plate_dir") or "plates")
         plates_out_dir = video_output_dir / plate_dirname
@@ -917,49 +809,6 @@ def main() -> None:
             plate_cfg_resolved["fine_crop_mode"] = fine_mode
             plate_cfg_resolved["save_fine_plate"] = _resolve_bool("save_fine_plate", True)
             plate_cfg_resolved["save_gray_plate"] = _resolve_bool("save_gray_plate", False)
-            ocr_conf_min = _resolve_float("ocr_conf_min", 0.15)
-            ocr_engine_name = str(
-                config.get("ocr_engine")
-                or plate_cfg.get("ocr_engine")
-                or ocr_cfg_global.get("engine")
-                or "rapidocr"
-            )
-            plate_cfg_resolved["ocr_conf_min"] = ocr_conf_min
-            plate_cfg_resolved["ocr_engine"] = ocr_engine_name
-            if ocr_model_dir_cfg:
-                plate_cfg_resolved["ocr_model_dir"] = str(ocr_model_dir_cfg)
-            plate_cfg_resolved["ocr_lang"] = str(ocr_cfg_global.get("lang", "ch"))
-            plate_cfg_resolved["ocr_det"] = bool(ocr_cfg_global.get("det", False))
-            plate_cfg_resolved["ocr_rec"] = bool(ocr_cfg_global.get("rec", True))
-            plate_cfg_resolved["ocr_use_angle_cls"] = bool(
-                ocr_cfg_global.get("use_angle_cls", False)
-            )
-            plate_cfg_resolved["ocr_use_gpu"] = ocr_use_gpu
-            plate_cfg_resolved["ocr_min_height"] = int(ocr_cfg_global.get("min_height", 96))
-            plate_cfg_resolved["ocr_write_empty"] = bool(
-                ocr_cfg_global.get("write_empty", True)
-            )
-
-            plate_ocr_instance: Optional[PlateOCR] = None
-            try:
-                plate_ocr_instance = PlateOCR(
-                    engine=plate_cfg_resolved.get("ocr_engine", "rapidocr"),
-                    min_conf=ocr_conf_min,
-                    lang=plate_cfg_resolved.get("ocr_lang", "ch"),
-                    det=plate_cfg_resolved.get("ocr_det", False),
-                    rec=plate_cfg_resolved.get("ocr_rec", True),
-                    use_angle_cls=plate_cfg_resolved.get("ocr_use_angle_cls", False),
-                    ocr_model_dir=plate_cfg_resolved.get("ocr_model_dir"),
-                    use_gpu=plate_cfg_resolved.get("ocr_use_gpu", False),
-                    min_height=plate_cfg_resolved.get("ocr_min_height", 96),
-                    write_empty=plate_cfg_resolved.get("ocr_write_empty", True),
-                    log_csv_path="",
-                    crops_dir="",
-                )
-            except Exception as exc:
-                print(f"[plate] RapidOCR unavailable; continuing without OCR: {exc}")
-                plate_ocr_instance = None
-
             fine_detector: Optional[FinePlateDetector] = None
             if fine_mode == "redetect":
                 try:
@@ -996,7 +845,6 @@ def main() -> None:
                     plates_out_dir,
                     detector=detector,
                     fine_detector=fine_detector,
-                    plate_ocr=plate_ocr_instance,
                     video_fps=metadata.fps,
                     cam_id=cam_id,
                 )
@@ -1029,12 +877,12 @@ def main() -> None:
             "plate_img": "",
             "plate_conf": None,
             "plate_score": None,
-            "plate_text": "",
             "tail_img": "",
             "plate_sharp_post": None,
-            "plate_ocr_conf": 0.0,
-            "plate_ocr_img": "",
             "fine_img": "",
+            "plate_det_conf": None,
+            "plate_det_bbox": "",
+            "plate_det_success": False,
             "plate_bbox_xyxy": "",
             "best_frame_img": "",
             "best_frame_w": 0,
@@ -1047,15 +895,6 @@ def main() -> None:
             frame = result.orig_img
             if frame is None:
                 continue
-            if (
-                frame_idx == 0
-                and frame_plate_runtime_enabled
-                and frame_plate_detector is not None
-                and frame_plate_ocr is None
-                and not ocr_warn_printed
-            ):
-                print("[WARN] OCR 未启用：未找到本地模型或初始化失败。仅保存裁剪图。")
-                ocr_warn_printed = True
             if frame_idx == 0:
                 roi_manager.ensure_ready((frame.shape[1], frame.shape[0]))
                 if roi_enabled:
@@ -1094,109 +933,6 @@ def main() -> None:
                     )
                 except Exception:
                     roi_polygon_np = None
-
-            if frame_plate_runtime_enabled and frame_plate_detector is not None:
-                frame_h, frame_w = frame.shape[:2]
-                detections = frame_plate_detector.detect(frame)
-                time_ms = int(round((frame_idx / fps) * 1000)) if fps > 0 else None
-                for det_idx, det_box in enumerate(detections):
-                    if det_box is None or len(det_box) < 4:
-                        continue
-                    x1 = max(0, int(math.floor(det_box[0])))
-                    y1 = max(0, int(math.floor(det_box[1])))
-                    x2 = min(frame_w, int(math.ceil(det_box[2])))
-                    y2 = min(frame_h, int(math.ceil(det_box[3])))
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size == 0:
-                        continue
-                    roi_flag = None
-                    if roi_enabled and roi_polygon_np is not None and len(roi_polygon_np) >= 3:
-                        cx = (x1 + x2) // 2
-                        cy = (y1 + y2) // 2
-                        try:
-                            roi_flag = (
-                                cv2.pointPolygonTest(roi_polygon_np, (cx, cy), False) >= 0
-                            )
-                        except Exception:
-                            roi_flag = None
-
-                    if frame_plate_ocr is None and not ocr_warn_printed:
-                        print(
-                            "[WARN] OCR 未启用：未找到本地模型或初始化失败。仅保存裁剪图。"
-                        )
-                        ocr_warn_printed = True
-
-                    if not ocr_save_crop:
-                        continue
-
-                    crop_identifier = f"det{det_idx}"
-                    crop_path, plate_text, plate_conf = save_plate_crop(
-                        frame=frame,
-                        bbox_xyxy=(x1, y1, x2, y2),
-                        ocr=frame_plate_ocr if frame_plate_ocr is not None else None,
-                        min_conf=ocr_min_conf,
-                        crops_dir=ocr_crops_dir,
-                        timestamp=time_ms,
-                        track_id=crop_identifier,
-                        cam_id=frame_plate_cam_id,
-                        roi_flag=roi_flag,
-                    )
-
-                    if (
-                        frame_plate_ocr is not None
-                        and crop_path
-                        and (frame_plate_ocr.write_empty or plate_text)
-                    ):
-                        log_path = Path(frame_plate_ocr.log_csv_path)
-                        log_path.parent.mkdir(parents=True, exist_ok=True)
-                        if not log_path.exists():
-                            with open(log_path, "w", newline="", encoding="utf-8") as f:
-                                csv.writer(f).writerow(
-                                    [
-                                        "event_id",
-                                        "timestamp",
-                                        "video_time_ms",
-                                        "frame_idx",
-                                        "plate_text",
-                                        "rec_confidence",
-                                        "image_path",
-                                        "bbox_x1",
-                                        "bbox_y1",
-                                        "bbox_x2",
-                                        "bbox_y2",
-                                        "cam_id",
-                                        "roi_flag",
-                                        "reason",
-                                    ]
-                                )
-                        event_id = uuid.uuid4().hex[:8]
-                        timestamp_now = int(time.time())
-                        with open(log_path, "a", newline="", encoding="utf-8") as f:
-                            csv.writer(f).writerow(
-                                [
-                                    event_id,
-                                    timestamp_now,
-                                    int(time_ms) if time_ms is not None else "",
-                                    int(frame_idx),
-                                    plate_text,
-                                    round(float(plate_conf), 6),
-                                    str(crop_path),
-                                    x1,
-                                    y1,
-                                    x2,
-                                    y2,
-                                    frame_plate_cam_id or "",
-                                    "" if roi_flag is None else roi_flag,
-                                    "",
-                                ]
-                            )
-
-                    if frame_plate_ocr is not None and not plate_text:
-                        print(
-                            f"[OCR empty] frame={frame_idx} box=({x1},{y1},{x2},{y2}) conf={plate_conf:.3f}"
-                        )
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []
@@ -1378,87 +1114,6 @@ def main() -> None:
             clip_post_seconds,
             clip_subdir,
         )
-
-    if plate_enabled and plates_out_dir is not None:
-        tail_images = sorted(
-            p for p in plates_out_dir.glob("*_tail.*") if p.is_file()
-        )
-        if not tail_images:
-            print("[plate-lpr] 未找到车辆裁剪图，跳过 YOLOv5+HyperLPR 流程。")
-        else:
-            vehicle_crop_dir = plates_out_dir / "vehicle_roi"
-            vehicle_crop_dir.mkdir(parents=True, exist_ok=True)
-            for src in tail_images:
-                dest = vehicle_crop_dir / src.name
-                try:
-                    if not dest.exists() or src.stat().st_mtime > dest.stat().st_mtime:
-                        shutil.copy2(src, dest)
-                except Exception as exc:
-                    print(f"[plate-lpr] 同步车辆裁剪 {src.name} 失败: {exc}")
-
-            lp_cfg_section = dict(plate_cfg.get("lp_pipeline") or {})
-
-            def _lp_value(key: str, default):
-                val = lp_cfg_section.get(key)
-                if val is None:
-                    val = plate_cfg.get(key)
-                return default if val is None else val
-
-            out_dir_raw = _lp_value("out_dir", "runs/plates")
-            yolo_weights_raw = _lp_value("yolo_weights", "weights/plate_best.pt")
-            img_size_val = int(_lp_value("img_size", 640))
-            conf_val = float(_lp_value("conf_thres", 0.25))
-            iou_val = float(_lp_value("iou_thres", 0.45))
-            expand_val = float(_lp_value("expand_ratio", 0.10))
-            save_candidates_val = bool(_lp_value("save_candidates", True))
-            use_hub_val = bool(_lp_value("use_hub", True))
-            download_url_val = _lp_value("download_url", None)
-
-            out_dir_path = resolve_path(ROOT, str(out_dir_raw))
-            weights_path_candidate = resolve_path(ROOT, str(yolo_weights_raw))
-            weights_exists = weights_path_candidate.exists()
-            if not weights_exists:
-                if use_hub_val:
-                    print(
-                        "[plate-lpr] 车牌检测权重缺失: "
-                        f"{weights_path_candidate}。将尝试通过 PyTorch Hub 加载。"
-                    )
-                else:
-                    resolved_url = download_url_val or os.getenv("PLATE_YOLOV5_URL")
-                    if not resolved_url:
-                        print(
-                            "[plate-lpr] 车牌检测权重缺失: "
-                            f"{weights_path_candidate}。将尝试自动下载默认 YOLOv5 权重。"
-                        )
-                    else:
-                        print(
-                            "[plate-lpr] 车牌检测权重缺失: "
-                            f"{weights_path_candidate}。将尝试从 {resolved_url} 下载。"
-                        )
-            try:
-                from modules.lp_pipeline import process_vehicle_folder
-            except Exception as exc:
-                print(f"[plate-lpr] 无法导入车牌识别流水线: {exc}")
-            else:
-                try:
-                    results_csv = process_vehicle_folder(
-                        vehicle_dir=str(vehicle_crop_dir),
-                        out_dir=str(out_dir_path),
-                        yolo_weights=str(weights_path_candidate),
-                        img_size=img_size_val,
-                        conf_thres=conf_val,
-                        iou_thres=iou_val,
-                        expand_ratio=expand_val,
-                        save_candidates=save_candidates_val,
-                        use_hub=use_hub_val,
-                        download_url=download_url_val,
-                    )
-                    print(f"[plate-lpr] 车牌识别完成: {results_csv}")
-                except RuntimeError as exc:
-                    print(f"[plate-lpr] YOLOv5+HyperLPR 流程失败: {exc}")
-                except Exception as exc:
-                    print(f"[plate-lpr] 执行 YOLOv5+HyperLPR 流程时出错: {exc}")
-
 
 if __name__ == "__main__":
     main()
