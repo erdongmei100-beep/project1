@@ -39,6 +39,17 @@ roi:
     track_min_frames: 6      # 预留：用于调参报告记录的跟踪帧阈值
     entry_window_frames: 12  # 预留：调参脚本可使用的窗口大小
     per_track: true          # 预留：调参脚本是否逐轨迹记录
+  laneatt:
+    sample_frames: 18
+    top_ratio: 0.35
+    bottom_margin: 18
+    buffer: 12
+    min_score: 0.05
+    min_lane_frames: 4
+    allow_auto_cv_fallback: true
+    save_debug: true
+    laneatt:
+      weights: ''
 events:
   min_frames_in: 5
   min_frames_out: 5

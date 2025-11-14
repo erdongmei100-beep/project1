@@ -8,7 +8,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import cv2
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None  # type: ignore
 import numpy as np
 
 from src.utils.paths import OUTPUTS_DIR
@@ -441,6 +444,8 @@ def estimate_roi(
     overlay: bool = False,
     overlay_dir: Optional[Path] = None,
 ) -> AutoCVResult:
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for automatic ROI estimation.")
     start_time = time.time()
     frames, fps = _sample_frames(video_path, params)
     if not frames:
@@ -451,7 +456,7 @@ def estimate_roi(
             used_frames=[],
             line=None,
             params_used=params,
-            metrics={},
+            metrics={"engine": "auto_cv"},
             duration=time.time() - start_time,
             message="No frames sampled for auto ROI",
         )
@@ -479,7 +484,7 @@ def estimate_roi(
             used_frames=used_indices,
             line=None,
             params_used=active_params,
-            metrics={},
+            metrics={"engine": "auto_cv"},
             duration=time.time() - start_time,
             message="No lane line detected",
         )
@@ -494,12 +499,13 @@ def estimate_roi(
             used_frames=used_indices,
             line=fused,
             params_used=active_params,
-            metrics={},
+            metrics={"engine": "auto_cv"},
             duration=time.time() - start_time,
             message="Unable to derive polygon from detected line",
         )
 
     metrics = _compute_metrics(polygon, base_frame)
+    metrics["engine"] = "auto_cv"
     height_ok = metrics.get("roi_height", 0.0) >= active_params.min_box_h_px
     area_ok = metrics.get("rel_area", 0.0) >= active_params.min_rel_area
     aspect_ok = metrics.get("roi_aspect", 0.0) >= active_params.bbox_aspect_min
