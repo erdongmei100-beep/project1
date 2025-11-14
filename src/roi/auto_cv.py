@@ -440,8 +440,10 @@ def estimate_roi(
     *,
     overlay: bool = False,
     overlay_dir: Optional[Path] = None,
+    device: Optional[str] = None,
 ) -> AutoCVResult:
     start_time = time.time()
+    device_resolved = (device or "cpu").strip() or "cpu"
     frames, fps = _sample_frames(video_path, params)
     if not frames:
         return AutoCVResult(
@@ -451,7 +453,7 @@ def estimate_roi(
             used_frames=[],
             line=None,
             params_used=params,
-            metrics={},
+            metrics={"device": device_resolved},
             duration=time.time() - start_time,
             message="No frames sampled for auto ROI",
         )
@@ -479,7 +481,7 @@ def estimate_roi(
             used_frames=used_indices,
             line=None,
             params_used=active_params,
-            metrics={},
+            metrics={"device": device_resolved},
             duration=time.time() - start_time,
             message="No lane line detected",
         )
@@ -494,7 +496,7 @@ def estimate_roi(
             used_frames=used_indices,
             line=fused,
             params_used=active_params,
-            metrics={},
+            metrics={"device": device_resolved},
             duration=time.time() - start_time,
             message="Unable to derive polygon from detected line",
         )
@@ -522,6 +524,7 @@ def estimate_roi(
     metrics["duration_s"] = duration
     metrics["frames"] = len(frames)
     metrics["fallback_variant"] = fallback_variant
+    metrics["device"] = device_resolved
 
     message = ""
     if not success:

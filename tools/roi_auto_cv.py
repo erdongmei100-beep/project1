@@ -7,6 +7,7 @@ from typing import Sequence
 
 from src.roi.auto_cv import AutoCVParams, estimate_roi, save_roi_json
 from src.utils.config import load_config, resolve_path
+from src.utils.device import select_device
 from src.utils.paths import ROOT
 
 
@@ -31,6 +32,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Persist overlay PNG alongside the video stem",
     )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Computation device for auto ROI inference (e.g. cuda or cpu)",
+    )
     return parser.parse_args(argv)
 
 
@@ -41,6 +47,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     roi_cfg = dict(config.get("roi", {}) or {})
     auto_cfg = roi_cfg.get("auto_cv", {})
     params = AutoCVParams.from_config(auto_cfg)
+
+    device = select_device(args.device, feature="auto ROI")
+    print(f"Using device for auto ROI: {device}")
 
     source_path = resolve_path(ROOT, args.source)
     if not source_path.exists():
@@ -55,7 +64,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         out_path = out_dir / f"{source_path.stem}.json"
 
     print(f"Running auto_cv for {source_path}")
-    result = estimate_roi(source_path, params, overlay=args.save_overlay)
+    result = estimate_roi(source_path, params, overlay=args.save_overlay, device=device)
     if not result.success or result.polygon is None:
         raise SystemExit(f"Auto ROI failed: {result.message}")
 
@@ -68,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "min_sharpness": params.min_sharpness,
             "bbox_aspect_min": params.bbox_aspect_min,
         },
+        "device": device,
     }
     save_roi_json(out_path, result.base_size, result.polygon, meta)
     print(f"ROI saved to {out_path}")

@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from src.roi.auto_cv import AutoCVParams, estimate_roi, save_roi_json
 from src.utils.config import load_config, resolve_path, save_config
+from src.utils.device import select_device
 from src.utils.paths import ROOT
 
 
@@ -42,6 +43,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--save-overlays",
         action="store_true",
         help="Persist overlay PNGs for the final parameter sweep",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Computation device for auto ROI inference (e.g. cuda or cpu)",
     )
     parser.add_argument(
         "--overwrite",
@@ -129,11 +135,17 @@ def _score_result(result) -> float:
     return base
 
 
-def _evaluate(videos: Sequence[Path], params: AutoCVParams, *, overlay: bool = False) -> List[Tuple[Path, object]]:
+def _evaluate(
+    videos: Sequence[Path],
+    params: AutoCVParams,
+    *,
+    overlay: bool = False,
+    device: str = "cpu",
+) -> List[Tuple[Path, object]]:
     results: List[Tuple[Path, object]] = []
     for video in videos:
         try:
-            result = estimate_roi(video, params, overlay=overlay)
+            result = estimate_roi(video, params, overlay=overlay, device=device)
         except Exception as exc:
             result = None
             print(f"[WARN] Failed to evaluate {video.name} with error: {exc}")
@@ -148,14 +160,20 @@ def _aggregate_score(results: Sequence[Tuple[Path, object]]) -> float:
     return total
 
 
-def _best_from_grid(videos: Sequence[Path], params: AutoCVParams, offsets: Dict[str, Tuple[float, ...]]) -> AutoCVParams:
+def _best_from_grid(
+    videos: Sequence[Path],
+    params: AutoCVParams,
+    offsets: Dict[str, Tuple[float, ...]],
+    *,
+    device: str,
+) -> AutoCVParams:
     keys = list(offsets.keys())
     best_params = params
     best_score = float("-inf")
     for deltas in itertools.product(*[offsets[key] for key in keys]):
         offset_map = {key: deltas[idx] for idx, key in enumerate(keys)}
         candidate = _apply_offsets(params, offset_map)
-        results = _evaluate(videos, candidate)
+        results = _evaluate(videos, candidate, device=device)
         score = _aggregate_score(results)
         if score > best_score:
             best_score = score
@@ -174,12 +192,13 @@ def _run_final_pass(
     save_overlays: bool,
     overwrite: bool,
     report_path: Path,
+    device: str,
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     for video in tqdm(videos, desc="Final auto_cv pass"):
         start = time.time()
         try:
-            result = estimate_roi(video, params, overlay=save_overlays)
+            result = estimate_roi(video, params, overlay=save_overlays, device=device)
         except Exception as exc:
             duration = time.time() - start
             rows.append(
@@ -202,6 +221,7 @@ def _run_final_pass(
                     "mode": "auto_cv",
                     "metrics": result.metrics,
                     "params": asdict(result.params_used),
+                    "device": device,
                 }
                 save_roi_json(roi_path, result.base_size, result.polygon, meta)
         rows.append(
@@ -236,11 +256,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     auto_cfg = roi_cfg.get("auto_cv", {})
     base_params = AutoCVParams.from_config(auto_cfg)
 
+    device = select_device(args.device, feature="auto ROI tuning")
+    print(f"Using device for auto ROI tuning: {device}")
+
     coarse_offsets = _coarse_offsets(args.coarse_step)
-    coarse_best = _best_from_grid(videos, base_params, coarse_offsets)
+    coarse_best = _best_from_grid(videos, base_params, coarse_offsets, device=device)
 
     fine_offsets = _fine_offsets(coarse_best, coarse_offsets, args.fine_step)
-    final_params = _best_from_grid(videos, coarse_best, fine_offsets)
+    final_params = _best_from_grid(videos, coarse_best, fine_offsets, device=device)
 
     report_path = resolve_path(ROOT, args.out)
     df = _run_final_pass(
@@ -249,6 +272,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         save_overlays=args.save_overlays,
         overwrite=args.overwrite,
         report_path=report_path,
+        device=device,
     )
 
     print("\nAuto ROI tuning summary:")

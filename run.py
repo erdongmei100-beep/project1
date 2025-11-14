@@ -37,6 +37,7 @@ from src.roi.auto_cv import AutoCVParams, estimate_roi, save_roi_json
 from src.roi.manual import draw_roi_interactively
 from src.roi.manager import ROIManager
 from src.utils.config import load_config, resolve_path
+from src.utils.device import select_device
 from src.utils.paths import CONFIGS_DIR, OUTPUTS_DIR, ROOT, WEIGHTS_DIR
 from src.plates import VehicleFilter
 
@@ -564,12 +565,19 @@ def main() -> None:
     if roi_path is None and roi_mode in {"auto", "auto_cv"}:
         auto_cfg = roi_cfg.get("auto_cv") or roi_cfg.get("auto") or {}
         params = AutoCVParams.from_config(auto_cfg)
+        device_pref = str(roi_cfg.get("device", "cuda") or "cuda")
+        roi_device = select_device(device_pref, feature="auto ROI")
         target_dir = roi_candidate.parent
         target_dir.mkdir(parents=True, exist_ok=True)
         roi_path = roi_candidate
-        print(f"Auto ROI enabled. Generating ROI to {roi_path}")
+        print(f"Auto ROI enabled. Generating ROI to {roi_path} (device={roi_device})")
         previous_roi = roi_candidate if roi_candidate.exists() else None
-        result = estimate_roi(source_path, params, overlay=params.save_debug)
+        result = estimate_roi(
+            source_path,
+            params,
+            overlay=params.save_debug,
+            device=roi_device,
+        )
         if result.polygon is None:
             print(f"Auto ROI failed: {result.message or '未知原因'}")
             if params.allow_tail_fallback and previous_roi is not None:
@@ -597,6 +605,7 @@ def main() -> None:
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "frames": result.used_frames,
                 "metrics": result.metrics,
+                "device": roi_device,
                 "params": {
                     "sample_frames": params_used.sample_frames,
                     "crop_right": params_used.crop_right,

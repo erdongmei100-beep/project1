@@ -18,6 +18,7 @@ roi:
   mode: manual  # manual=使用已有 JSON，auto_cv=根据视频自动估计
   dir: data/rois
   path: ""  # 兼容旧配置，若提供则覆盖 dir 推导的路径
+  device: cuda  # 自动 ROI 推理默认优先使用 GPU，可自动回退 CPU
   auto_cv:
     sample_frames: 18        # 自动 ROI 检测时抽样的帧数
     crop_right: 0.45         # 右侧裁剪比例，聚焦车道线区域
