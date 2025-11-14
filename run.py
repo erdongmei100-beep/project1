@@ -33,7 +33,7 @@ from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.render.overlay import draw_overlays
-from src.roi.auto_cv import AutoCVParams, estimate_roi, save_roi_json
+from src.roi import AutoCVParams, LaneATTParams, generate_emergency_lane_roi, save_roi_json
 from src.roi.manual import draw_roi_interactively
 from src.roi.manager import ROIManager
 from src.utils.config import load_config, resolve_path
@@ -561,18 +561,31 @@ def main() -> None:
             )
             roi_mode = "auto_cv"
 
-    if roi_path is None and roi_mode in {"auto", "auto_cv"}:
-        auto_cfg = roi_cfg.get("auto_cv") or roi_cfg.get("auto") or {}
-        params = AutoCVParams.from_config(auto_cfg)
-        target_dir = roi_candidate.parent
-        target_dir.mkdir(parents=True, exist_ok=True)
+    laneatt_cfg = roi_cfg.get("laneatt") or {}
+    auto_cfg = roi_cfg.get("auto_cv") or roi_cfg.get("auto") or {}
+    auto_params = AutoCVParams.from_config(auto_cfg)
+    laneatt_params = LaneATTParams.from_config(laneatt_cfg)
+    laneatt_modes = {"laneatt", "lane_att", "lane-att"}
+
+    if roi_path is None and roi_mode in laneatt_modes.union({"auto", "auto_cv"}):
         roi_path = roi_candidate
-        print(f"Auto ROI enabled. Generating ROI to {roi_path}")
+        mode_label = "LaneATT" if roi_mode in laneatt_modes else "Auto ROI"
+        print(f"{mode_label} enabled. Generating ROI to {roi_path}")
         previous_roi = roi_candidate if roi_candidate.exists() else None
-        result = estimate_roi(source_path, params, overlay=params.save_debug)
+        overlay_flag = (
+            laneatt_params.save_debug if roi_mode in laneatt_modes else auto_params.save_debug
+        )
+        result = generate_emergency_lane_roi(
+            source_path,
+            roi_mode,
+            laneatt_params=laneatt_params,
+            auto_cv_params=auto_params,
+            overlay=overlay_flag,
+        )
+        engine = str(result.metrics.get("engine", roi_mode))
         if result.polygon is None:
-            print(f"Auto ROI failed: {result.message or '未知原因'}")
-            if params.allow_tail_fallback and previous_roi is not None:
+            print(f"{engine} ROI failed: {result.message or '未知原因'}")
+            if auto_params.allow_tail_fallback and previous_roi is not None:
                 roi_path = previous_roi
                 print(
                     "检测到已有 ROI，按照 allow_tail_fallback 配置继续沿用: "
@@ -591,13 +604,20 @@ def main() -> None:
                 save_roi_json(roi_path, manual.base_size, manual.polygon, meta)
                 print(f"手动 ROI 已保存至: {roi_path}")
         else:
-            params_used = result.params_used
-            meta = {
-                "mode": "auto_cv" if result.success else "auto_cv_relaxed",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "frames": result.used_frames,
-                "metrics": result.metrics,
-                "params": {
+            if engine == "laneatt":
+                params_meta = {
+                    "sample_frames": laneatt_params.sample_frames,
+                    "top_ratio": laneatt_params.top_ratio,
+                    "bottom_margin": laneatt_params.bottom_margin,
+                    "buffer": laneatt_params.buffer,
+                    "min_score": laneatt_params.min_score,
+                    "min_lane_frames": laneatt_params.min_lane_frames,
+                    "allow_auto_cv_fallback": laneatt_params.allow_auto_cv_fallback,
+                    "save_debug": laneatt_params.save_debug,
+                }
+            else:
+                params_used = result.params_used
+                params_meta = {
                     "sample_frames": params_used.sample_frames,
                     "crop_right": params_used.crop_right,
                     "crop_bottom": params_used.crop_bottom,
@@ -615,9 +635,15 @@ def main() -> None:
                     "only_with_plate": params_used.only_with_plate,
                     "allow_tail_fallback": params_used.allow_tail_fallback,
                     "save_debug": params_used.save_debug,
-                },
+                }
+            meta = {
+                "mode": engine if result.success else f"{engine}_relaxed",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "frames": result.used_frames,
+                "metrics": result.metrics,
+                "params": params_meta,
             }
-            if not result.success:
+            if not result.success and engine == "auto_cv":
                 meta["status"] = {
                     "message": result.message or "validation_failed",
                     "fallback_variant": result.metrics.get("fallback_variant", 0),
@@ -629,7 +655,7 @@ def main() -> None:
             save_roi_json(roi_path, result.base_size, result.polygon, meta)
             overlay_path = result.metrics.get("overlay_path")
             if overlay_path:
-                print(f"Auto ROI overlay saved to {overlay_path}")
+                print(f"{engine} ROI overlay saved to {overlay_path}")
     elif roi_path is None:
         if roi_candidate is None:
             raise RuntimeError("ROI path must be provided when auto_cv is disabled.")
