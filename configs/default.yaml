@@ -19,6 +19,19 @@ roi:
   dir: data/rois
   path: ""  # 兼容旧配置，若提供则覆盖 dir 推导的路径
   device: cuda  # 自动 ROI 推理默认优先使用 GPU，可自动回退 CPU
+  laneaf:
+    enable: true              # 启用 LaneAF 作为应急车道 ROI 推理
+    weights: weights/laneaf_culane.pth  # 需提前下载的 LaneAF 权重
+    device: cuda              # LaneAF 推理设备，自动回退 CPU
+    confidence: 0.35          # LaneAF 输出热力图的平均置信度阈值
+    min_points: 6             # 车道折线保留的最小顶点数
+    bottom_ratio: 0.35        # 仅统计图像底部多少比例内的点进行左右排序
+    min_lane_height_ratio: 0.45  # LaneAF 折线在垂直方向上的覆盖比例
+    min_bottom_span_px: 20.0  # 底部样本点的横向跨度阈值
+    target_lane_index_from_right: 1  # 右起第几条车道线视为应急车道分界
+    simplify_step: 2          # 沿 LaneAF 折线取点的步长
+    right_margin_px: 0        # 可选：沿右边界内缩像素数
+    fallback_to_rightmost: true  # 若车道数量不足是否回退到最右侧
   auto_cv:
     sample_frames: 18        # 自动 ROI 检测时抽样的帧数
     crop_right: 0.45         # 右侧裁剪比例，聚焦车道线区域

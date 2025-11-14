@@ -148,3 +148,29 @@ python -m project.tools.roi_auto_cv \
 - 按 `Q` 或 `Esc`：退出手动标注。
 
 欢迎提交问题或改进建议。
+
+## LaneAF 车道线 ROI（实验功能）
+
+`configs/default.yaml` 中新增 `roi.laneaf` 配置段，可通过 LaneAF 车道检测网络生成更稳定的应急车道区域。
+
+- `enable`: 是否启用 LaneAF。若初始化失败会自动回退到旧版 auto_cv 算法。
+- `weights`: 预训练权重路径，需提前下载官方 `laneaf_culane.pth` 等模型并放入仓库。
+- `device`: 推理设备，默认 `cuda`，可自动降级为 `cpu`。
+- 其余阈值（如 `bottom_ratio`、`target_lane_index_from_right`）控制 LaneAF 折线到 ROI 的映射，可按现场情况调节。
+
+管线在生成 ROI 时会优先尝试 LaneAF：
+
+1. LaneAF 成功输出有效多边形，则直接保存为最终 ROI，并在 metadata 中记录 `mode=laneaf`。
+2. 若 LaneAF 未检测到足够车道线或通过率不足，会打印失败原因并自动回退到旧版 auto_cv 逻辑。
+
+可使用 `tools/test_laneaf_roi.py` 快速验证权重与阈值：
+
+```bash
+python tools/test_laneaf_roi.py \
+  --source data/videos/ambulance.mp4 \
+  --weights weights/laneaf_culane.pth \
+  --device cuda \
+  --stride 10
+```
+
+脚本会将叠加可视化保存到 `outputs/laneaf_roi_vis/`，便于人工检查 LaneAF 输出的多边形是否符合预期。

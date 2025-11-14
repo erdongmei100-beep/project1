@@ -6,12 +6,15 @@ import math
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from src.utils.paths import OUTPUTS_DIR
+
+if TYPE_CHECKING:  # pragma: no cover - optional dependency for type checkers only
+    from src.roi.laneaf_emergency_roi import LaneAFEmergencyROI
 
 Point = Tuple[int, int]
 Polygon = List[Point]
@@ -441,6 +444,9 @@ def estimate_roi(
     overlay: bool = False,
     overlay_dir: Optional[Path] = None,
     device: Optional[str] = None,
+    laneaf_roi: "LaneAFEmergencyROI" | None = None,
+    use_laneaf: bool = True,
+    laneaf_device: Optional[str] = None,
 ) -> AutoCVResult:
     start_time = time.time()
     device_resolved = (device or "cpu").strip() or "cpu"
@@ -459,6 +465,99 @@ def estimate_roi(
         )
 
     base_frame = frames[0][1]
+
+    laneaf_messages: List[str] = []
+    if use_laneaf and laneaf_roi is not None:
+        try:
+            from src.roi.laneaf_emergency_roi import LaneAFEstimationError
+        except Exception:  # pragma: no cover - optional dependency guard
+            LaneAFEstimationError = RuntimeError  # type: ignore[assignment]
+
+        laneaf_polygon: Optional[Polygon] = None
+        laneaf_metrics: Dict[str, float] = {}
+        laneaf_frame: Optional[np.ndarray] = None
+        laneaf_used_frame: Optional[int] = None
+
+        for frame_index, frame in frames:
+            try:
+                polygon_candidate = laneaf_roi.get_roi(frame)
+            except LaneAFEstimationError as exc:  # type: ignore[arg-type]
+                laneaf_messages.append(str(exc))
+                continue
+            except Exception as exc:  # pragma: no cover - defensive guard
+                laneaf_messages.append(f"LaneAF error: {exc}")
+                continue
+
+            if not polygon_candidate or len(polygon_candidate) < 3:
+                laneaf_messages.append("LaneAF 返回的多边形顶点不足，忽略该帧。")
+                continue
+
+            metrics_candidate = _compute_metrics(polygon_candidate, frame)
+            height_ok = metrics_candidate.get("roi_height", 0.0) >= params.min_box_h_px
+            area_ok = metrics_candidate.get("rel_area", 0.0) >= params.min_rel_area
+            aspect_ok = metrics_candidate.get("roi_aspect", 0.0) >= params.bbox_aspect_min
+            sharp_ok = metrics_candidate.get("sharpness", 0.0) >= params.min_sharpness
+
+            if height_ok and area_ok and aspect_ok and (
+                not params.only_with_plate or sharp_ok
+            ):
+                laneaf_polygon = polygon_candidate
+                laneaf_metrics = metrics_candidate
+                laneaf_frame = frame
+                laneaf_used_frame = frame_index
+                break
+
+            failed_reasons = []
+            if not height_ok:
+                failed_reasons.append("roi_height")
+            if not area_ok:
+                failed_reasons.append("rel_area")
+            if not aspect_ok:
+                failed_reasons.append("roi_aspect")
+            if params.only_with_plate and not sharp_ok:
+                failed_reasons.append("sharpness")
+            detail = ", ".join(failed_reasons) or "LaneAF 验证未通过"
+            laneaf_messages.append(f"LaneAF 多边形未通过阈值过滤: {detail}")
+
+        if laneaf_polygon is not None and laneaf_frame is not None:
+            metrics = dict(laneaf_metrics)
+            duration_laneaf = time.time() - start_time
+            laneaf_device_resolved = laneaf_device or device_resolved
+            metrics.update(
+                {
+                    "fps": fps,
+                    "duration_s": duration_laneaf,
+                    "frames": len(frames),
+                    "fallback_variant": 0,
+                    "device": device_resolved,
+                    "laneaf": 1.0,
+                    "laneaf_device": laneaf_device_resolved,
+                }
+            )
+            if laneaf_messages:
+                metrics["laneaf_notes"] = " | ".join(laneaf_messages)
+
+            vis_laneaf = None
+            if overlay and params.save_debug:
+                target_dir = overlay_dir or (OUTPUTS_DIR / "auto_cv")
+                target_dir.mkdir(parents=True, exist_ok=True)
+                vis_laneaf = _draw_overlay(laneaf_frame, laneaf_polygon, None, metrics)
+                overlay_path = target_dir / f"{video_path.stem}_overlay.png"
+                if cv2.imwrite(str(overlay_path), vis_laneaf):
+                    metrics["overlay_path"] = str(overlay_path)
+
+            return AutoCVResult(
+                success=True,
+                polygon=laneaf_polygon,
+                base_size=(laneaf_frame.shape[1], laneaf_frame.shape[0]),
+                used_frames=[laneaf_used_frame] if laneaf_used_frame is not None else [],
+                line=None,
+                params_used=params,
+                metrics=metrics,
+                duration=duration_laneaf,
+                message="LaneAF",
+                overlay=vis_laneaf,
+            )
     active_params = params
     detected, used_indices = _detect_lines_for_frames(frames, active_params)
     fallback_variant = 0
@@ -502,6 +601,10 @@ def estimate_roi(
         )
 
     metrics = _compute_metrics(polygon, base_frame)
+    if laneaf_messages:
+        metrics["laneaf_notes"] = " | ".join(laneaf_messages)
+    if laneaf_device:
+        metrics.setdefault("laneaf_device", laneaf_device)
     height_ok = metrics.get("roi_height", 0.0) >= active_params.min_box_h_px
     area_ok = metrics.get("rel_area", 0.0) >= active_params.min_rel_area
     aspect_ok = metrics.get("roi_aspect", 0.0) >= active_params.bbox_aspect_min

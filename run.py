@@ -533,6 +533,7 @@ def main() -> None:
     roi_mode_override = (getattr(args, "roi_mode", "") or "").strip().lower()
     roi_mode = roi_mode_override or roi_mode_cfg
 
+
     roi_dir_value = getattr(args, "roi_dir", None) or roi_cfg.get("dir") or ""
     if roi_dir_value:
         roi_dir_path = resolve_path(ROOT, roi_dir_value)
@@ -562,6 +563,48 @@ def main() -> None:
             )
             roi_mode = "auto_cv"
 
+    laneaf_cfg = dict(roi_cfg.get("laneaf") or {})
+    laneaf_enabled = bool(laneaf_cfg.get("enable", True)) and roi_mode in {"auto", "auto_cv"}
+    laneaf_roi_estimator = None
+    laneaf_weights_path: Optional[Path] = None
+    laneaf_device: Optional[str] = None
+    if laneaf_enabled:
+        try:
+            from lane_detection.laneaf import LaneAFDetector
+            from src.roi.laneaf_emergency_roi import LaneAFEmergencyROI, LaneAFROIConfig
+        except Exception as exc:  # pragma: no cover - optional dependency guard
+            print(f"LaneAF 模块导入失败: {exc}. 将继续使用旧版 auto_cv ROI。")
+            laneaf_enabled = False
+        else:
+            weights_value = laneaf_cfg.get("weights")
+            if not weights_value:
+                print("LaneAF 权重路径未配置，自动回退旧版 ROI 逻辑。")
+                laneaf_enabled = False
+            else:
+                laneaf_weights_path = resolve_path(ROOT, weights_value)
+                laneaf_device_pref = str(
+                    laneaf_cfg.get("device", roi_cfg.get("device", "cuda")) or "cuda"
+                )
+                laneaf_device = select_device(laneaf_device_pref, feature="LaneAF ROI")
+                try:
+                    detector = LaneAFDetector(
+                        laneaf_weights_path,
+                        device=laneaf_device,
+                        input_size=(288, 832),
+                        confidence_threshold=float(laneaf_cfg.get("confidence", 0.35)),
+                        min_points=int(laneaf_cfg.get("min_points", 6)),
+                    )
+                    roi_settings = LaneAFROIConfig.from_config(laneaf_cfg)
+                    laneaf_roi_estimator = LaneAFEmergencyROI(detector, roi_settings)
+                    print(
+                        "LaneAF ROI 已启用，权重: "
+                        f"{laneaf_weights_path} (device={laneaf_device})"
+                    )
+                except Exception as exc:
+                    print(f"LaneAF 初始化失败: {exc}. 将继续使用旧版 auto_cv ROI。")
+                    laneaf_enabled = False
+                    laneaf_roi_estimator = None
+
     if roi_path is None and roi_mode in {"auto", "auto_cv"}:
         auto_cfg = roi_cfg.get("auto_cv") or roi_cfg.get("auto") or {}
         params = AutoCVParams.from_config(auto_cfg)
@@ -577,6 +620,9 @@ def main() -> None:
             params,
             overlay=params.save_debug,
             device=roi_device,
+            laneaf_roi=laneaf_roi_estimator,
+            use_laneaf=laneaf_enabled,
+            laneaf_device=laneaf_device,
         )
         if result.polygon is None:
             print(f"Auto ROI failed: {result.message or '未知原因'}")
@@ -600,12 +646,18 @@ def main() -> None:
                 print(f"手动 ROI 已保存至: {roi_path}")
         else:
             params_used = result.params_used
+            mode_label = (
+                "laneaf"
+                if result.metrics.get("laneaf")
+                else ("auto_cv" if result.success else "auto_cv_relaxed")
+            )
+            device_record = str(result.metrics.get("laneaf_device", roi_device))
             meta = {
-                "mode": "auto_cv" if result.success else "auto_cv_relaxed",
+                "mode": mode_label,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "frames": result.used_frames,
                 "metrics": result.metrics,
-                "device": roi_device,
+                "device": device_record,
                 "params": {
                     "sample_frames": params_used.sample_frames,
                     "crop_right": params_used.crop_right,
