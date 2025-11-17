@@ -14,13 +14,22 @@ except Exception:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore
 import numpy as np
 
-from lane_detection.laneatt import LaneATTConfig, LaneATTDetector
+from src.lane_detection.laneatt import LaneATTConfig, LaneATTDetector
 
 from src.utils.paths import OUTPUTS_DIR
 from .auto_cv import AutoCVParams, AutoCVResult, estimate_roi as estimate_roi_auto
 
 Point = Tuple[int, int]
 Polygon = List[Point]
+
+
+class LaneATTError:
+    NO_LANES = "no_lanes"
+    TOO_FEW_POINTS = "too_few_points"
+    BAD_POLYGON = "bad_polygon"
+    SMALL_AREA = "small_area"
+    EMPTY_MASK = "empty_mask"
+    HOUGH_FALLBACK_USED = "hough_fallback"
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +49,12 @@ class LaneATTParams:
     """LaneATT powered ROI generation configuration."""
 
     sample_frames: int = 18
-    bottom_ratio: float = 0.3
+    bottom_ratio: float = 0.35
     target_lane_index_from_right: int = 2
+    min_bottom_points: int = 6
+    min_poly_points: int = 5
+    min_roi_area_ratio: float = 0.01
+    allow_hough_fallback: bool = True
     min_lane_frames: int = 4
     min_lanes_for_roi: int = 1
     allow_auto_cv_fallback: bool = True
@@ -67,6 +80,10 @@ class LaneATTParams:
             target_lane_index_from_right=int(
                 max(1, data.get("target_lane_index_from_right", cls.target_lane_index_from_right))
             ),
+            min_bottom_points=int(max(1, data.get("min_bottom_points", cls.min_bottom_points))),
+            min_poly_points=int(max(3, data.get("min_poly_points", cls.min_poly_points))),
+            min_roi_area_ratio=float(max(0.0, data.get("min_roi_area_ratio", cls.min_roi_area_ratio))),
+            allow_hough_fallback=bool(data.get("allow_hough_fallback", cls.allow_hough_fallback)),
             min_lane_frames=int(max(1, data.get("min_lane_frames", cls.min_lane_frames))),
             min_lanes_for_roi=int(max(1, data.get("min_lanes_for_roi", cls.min_lanes_for_roi))),
             allow_auto_cv_fallback=bool(
@@ -118,8 +135,19 @@ def _select_target_lane(
         if lane.ndim != 2 or lane.shape[1] != 2:
             continue
         pts = np.asarray(lane, dtype=float)
+        pts = pts[np.argsort(pts[:, 1])]
         pts_bottom = pts[pts[:, 1] >= y_threshold]
-        if len(pts_bottom) == 0:
+        if len(pts_bottom) < params.min_bottom_points and len(pts) >= 2:
+            y_start = max(y_threshold, float(pts[:, 1].min()))
+            y_end = float(pts[:, 1].max())
+            if y_end > y_start:
+                y_interp = np.linspace(y_start, y_end, num=params.min_bottom_points)
+                x_interp = np.interp(y_interp, pts[:, 1], pts[:, 0])
+                new_pts = np.stack([x_interp, y_interp], axis=1)
+                pts_bottom = new_pts
+                pts = np.vstack([pts, new_pts])
+                pts = pts[np.argsort(pts[:, 1])]
+        if len(pts_bottom) < params.min_bottom_points:
             continue
         avg_x = float(pts_bottom[:, 0].mean())
         candidates.append((avg_x, pts))
@@ -129,8 +157,10 @@ def _select_target_lane(
         return None, lane_count
 
     candidates.sort(key=lambda item: item[0])
-    target_idx = min(params.target_lane_index_from_right, lane_count)
-    avg_x, pts = candidates[-target_idx]
+    target_idx = -params.target_lane_index_from_right
+    if lane_count < params.target_lane_index_from_right:
+        target_idx = -1
+    avg_x, pts = candidates[target_idx]
     return (
         LaneCandidate(
             pts=pts,
@@ -146,35 +176,52 @@ def _select_target_lane(
 
 def _build_roi_polygon(
     lane_pts: np.ndarray, frame_shape: Tuple[int, int], params: LaneATTParams
-) -> Tuple[Optional[np.ndarray], Optional[Polygon]]:
+) -> Tuple[Optional[np.ndarray], Optional[Polygon], Optional[str]]:
     height, width = frame_shape
     bottom_ratio = float(np.clip(params.bottom_ratio, 0.05, 0.95))
     y_top = int(height * (1.0 - bottom_ratio))
 
     pts = np.asarray(lane_pts, dtype=float)
     lane_segment = pts[pts[:, 1] >= y_top]
+    lane_segment = lane_segment[np.argsort(lane_segment[:, 1])]
     if len(lane_segment) < 2:
-        return None, None
+        return None, None, LaneATTError.TOO_FEW_POINTS
 
-    # Sort from bottom to top to construct a polygon that hugs the lane line.
-    lane_segment = lane_segment[np.argsort(-lane_segment[:, 1])]
+    if len(lane_segment) < params.min_poly_points and len(lane_segment) >= 2:
+        bottom_pts = lane_segment[-min(len(lane_segment), 8) :]
+        ys = bottom_pts[:, 1]
+        xs = bottom_pts[:, 0]
+        if len(bottom_pts) >= 2:
+            coef = np.polyfit(ys, xs, 1)
+            y_new = np.linspace(y_top, ys.max(), num=params.min_poly_points)
+            x_new = coef[0] * y_new + coef[1]
+            extrapolated = np.stack([x_new, y_new], axis=1)
+            lane_segment = np.vstack([lane_segment, extrapolated])
+            lane_segment = lane_segment[np.argsort(lane_segment[:, 1])]
+    if len(lane_segment) < params.min_poly_points:
+        return None, None, LaneATTError.TOO_FEW_POINTS
+
+    lane_points: Polygon = []
+    for x, y in lane_segment[::-1]:
+        lane_points.append((int(round(x)), int(round(y))))
+    top_y = lane_points[-1][1]
 
     poly: Polygon = []
-    for x, y in lane_segment:
-        poly.append((int(round(x)), int(round(y))))
-
-    top_y = int(round(lane_segment[-1][1]))
-
-    # Close the polygon along the right border – avoids the previous bug that
-    # produced a vertical strip from an averaged x position.
-    poly.append((width - 1, top_y))
-    poly.append((width - 1, height - 1))
-    poly.append((int(round(lane_segment[0][0])), height - 1))
+    for pt in lane_points:
+        if not poly or poly[-1] != pt:
+            poly.append(pt)
+    poly.extend([(width - 1, top_y), (width - 1, height - 1), (poly[0][0], height - 1)])
 
     poly_np = np.array(poly, dtype=np.int32)
+    area = cv2.contourArea(poly_np)
+    if area < params.min_roi_area_ratio * float(width * height):
+        return None, None, LaneATTError.SMALL_AREA
+
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(mask, [poly_np], 1)
-    return mask, poly
+    if mask.sum() == 0:
+        return None, None, LaneATTError.EMPTY_MASK
+    return mask, poly, None
 
 
 def _save_debug(
@@ -293,12 +340,16 @@ def estimate_roi_laneatt(
     chosen: Optional[LaneCandidate] = None
     polygon: Optional[Polygon] = None
     mask: Optional[np.ndarray] = None
+    reason: Optional[str] = None
     if not candidates:
         message = "laneatt_failed_no_lanes"
         success = False
     else:
         candidates.sort(key=lambda cand: cand.avg_x)
-        chosen = candidates[len(candidates) // 2]
+        idx = -params.target_lane_index_from_right
+        if len(candidates) < params.target_lane_index_from_right:
+            idx = -1
+        chosen = candidates[idx]
         if chosen.detected_lane_count < params.min_lanes_for_roi:
             logger.warning(
                 "LaneATT ROI: only %d lanes detected (min required %d), trying best-effort ROI",
@@ -306,11 +357,11 @@ def estimate_roi_laneatt(
                 params.min_lanes_for_roi,
             )
             last_reason = "not_enough_lanes"
-        mask, polygon = _build_roi_polygon(chosen.pts, chosen.frame.shape[:2], params)
+        mask, polygon, reason = _build_roi_polygon(chosen.pts, chosen.frame.shape[:2], params)
         overlay_frame = chosen.frame
         if mask is None or not polygon:
             success = False
-            message = "laneatt_failed_geometry"
+            message = reason or "laneatt_failed_geometry"
         else:
             success = True
             message = ""
@@ -364,7 +415,7 @@ def estimate_roi_laneatt(
         overlay=mask,
     )
 
-    if success or not params.allow_auto_cv_fallback:
+    if success or not params.allow_auto_cv_fallback or frames is not None:
         return result
 
     print("[LaneATT ROI] Falling back to auto_cv due to detection failure")

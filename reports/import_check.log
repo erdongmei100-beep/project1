@@ -1,0 +1,18 @@
+[OK] import src
+[OK] import src.roi
+[OK] import src.roi.laneatt
+[OK] import src.lane_detection
+[OK] import src.lane_detection.laneatt
+RESULT: PASS
+[OK] import src
+[OK] import src.roi
+[OK] import src.roi.laneatt
+[OK] import src.lane_detection
+[OK] import src.lane_detection.laneatt
+RESULT: PASS
+[WARN] Unable to open video: /workspace/project1/data/videos/2.mp4, using blank frame
+Frame saved: /workspace/project1/data/outputs/laneatt_detect/laneatt_frame_00160.jpg
+Lanes detected: 0 | model_loaded=False
+[WARN] Unable to open video: /workspace/project1/data/videos/2.mp4, using blank frame
+Frame saved: /workspace/project1/data/outputs/laneatt_detect/laneatt_frame_00160.jpg
+Lanes detected: 0 | model_loaded=False

@@ -10,6 +10,13 @@ from typing import Dict, List, Optional, Sequence
 
 import cv2
 
+# --- add project root to sys.path (bootstrap) ---
+import sys
+ROOT = Path(__file__).resolve().parents[1]  # <repo-root>/project1
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# ------------------------------------------------
+
 from src.plates.plate_cropper import PlateCropError, crop_tail_and_plate
 
 try:  # pragma: no cover - optional dependency

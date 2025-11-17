@@ -14,6 +14,13 @@ from typing import Any, Dict
 
 import yaml
 
+# --- add project root to sys.path (bootstrap) ---
+import sys
+ROOT = Path(__file__).resolve().parents[1]  # <repo-root>/project1
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# ------------------------------------------------
+
 from src.roi import AutoCVParams, LaneATTParams, estimate_roi_laneatt
 from src.utils.paths import OUTPUTS_DIR
 

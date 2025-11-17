@@ -3,8 +3,8 @@ from pathlib import Path
 
 import numpy as np
 
-from lane_detection.laneatt import LaneATTDetector, LaneATTConfig
-from lane_detection.laneatt import detector as laneatt_detector_module
+from src.lane_detection.laneatt import LaneATTConfig, LaneATTDetector
+from src.lane_detection.laneatt import detector as laneatt_detector_module
 from src.roi.laneatt import LaneATTParams, estimate_roi_laneatt
 
 

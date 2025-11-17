@@ -1,11 +1,11 @@
 """LaneATT lane detection integration utilities."""
-from .detector import (
+from src.lane_detection.laneatt.detector import (
     LaneATTConfig,
     LaneATTDetector,
     LaneDetection,
     LaneDetectionResult,
 )
-from .laneatt_model import LaneATTModel
+from src.lane_detection.laneatt.laneatt_model import LaneATTModel
 
 __all__ = [
     "LaneATTConfig",

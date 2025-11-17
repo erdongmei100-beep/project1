@@ -5,6 +5,13 @@ import argparse
 from pathlib import Path
 from typing import Sequence
 
+# --- add project root to sys.path (bootstrap) ---
+import sys
+ROOT = Path(__file__).resolve().parents[1]  # <repo-root>/project1
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# ------------------------------------------------
+
 from src.roi.auto_cv import AutoCVParams, estimate_roi, save_roi_json
 from src.utils.config import load_config, resolve_path
 from src.utils.paths import ROOT
