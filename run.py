@@ -607,11 +607,10 @@ def main() -> None:
             if engine == "laneatt":
                 params_meta = {
                     "sample_frames": laneatt_params.sample_frames,
-                    "top_ratio": laneatt_params.top_ratio,
-                    "bottom_margin": laneatt_params.bottom_margin,
-                    "buffer": laneatt_params.buffer,
-                    "min_score": laneatt_params.min_score,
+                    "bottom_ratio": laneatt_params.bottom_ratio,
+                    "target_lane_index_from_right": laneatt_params.target_lane_index_from_right,
                     "min_lane_frames": laneatt_params.min_lane_frames,
+                    "min_lanes_for_roi": laneatt_params.min_lanes_for_roi,
                     "allow_auto_cv_fallback": laneatt_params.allow_auto_cv_fallback,
                     "save_debug": laneatt_params.save_debug,
                 }

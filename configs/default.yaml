@@ -41,16 +41,17 @@ roi:
     per_track: true          # 预留：调参脚本是否逐轨迹记录
   laneatt:
     sample_frames: 18           # LaneATT 推理时抽样的帧数
-    top_ratio: 0.35             # ROI 顶部相对高度（0~1），越小越靠近图像下方
-    bottom_margin: 18           # ROI 底部距离图像底边的安全边距（像素）
-    buffer: 12                  # ROI 相对车道线向右偏移的像素
-    min_score: 0.05             # 接受的 LaneATT 最小置信度
-    min_lane_frames: 4          # 至少检测到多少帧车道线才认为成功
+    bottom_ratio: 0.30          # 仅使用画面底部多少比例的车道点排序（0~1）
+    target_lane_index_from_right: 2  # 从右往左选择第几条线作为应急车道分界
+    min_lane_frames: 4          # 记录用途：期待至少有多少帧检测到车道线
+    min_lanes_for_roi: 1        # 只要至少检测到多少条车道线就尝试构造 ROI
     allow_auto_cv_fallback: true  # 失败时是否回退到 auto_cv 逻辑
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:
       weights: ''              # LaneATT 权重文件路径，留空则使用启发式回退
       device: auto             # 推理设备（auto / cpu / cuda:0 等）
+      input_width: null        # 若 LaneATT 输出使用模型输入分辨率，则在此指定宽度以便回缩
+      input_height: null       # 若 LaneATT 输出使用模型输入分辨率，则在此指定高度以便回缩
       min_length_px: 80        # 车道线最小长度（像素）
       canny_threshold1: 80     # Canny 边缘检测阈值 1（回退模式）
       canny_threshold2: 160    # Canny 边缘检测阈值 2（回退模式）
