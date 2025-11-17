@@ -25,31 +25,34 @@ class LaneATTLaneDetectionTests(unittest.TestCase):
 
     def test_detector_returns_lane(self) -> None:
         detector = LaneATTDetector(LaneATTConfig())
-        result = detector.detect(self.frame)
-        self.assertTrue(result.lanes, "Expected at least one lane detection")
-        best = result.best_lane
-        self.assertIsNotNone(best)
-        self.assertGreater(best.length, 0)
+        lanes = detector.detect_lanes(self.frame)
+        self.assertTrue(lanes, "Expected at least one lane detection")
+        for lane in lanes:
+            self.assertEqual(lane.shape[1], 2)
+            self.assertTrue((lane[:, 0] >= 0).all())
+            self.assertTrue((lane[:, 1] >= 0).all())
+            self.assertLessEqual(lane[:, 0].max(), self.frame.shape[1] - 1)
+            self.assertLessEqual(lane[:, 1].max(), self.frame.shape[0] - 1)
 
     def test_estimate_roi_laneatt(self) -> None:
         params = LaneATTParams(
             sample_frames=1,
             min_lane_frames=1,
             save_debug=False,
-            buffer=5,
-            top_ratio=0.5,
+            bottom_ratio=0.4,
         )
         result = estimate_roi_laneatt(Path("synthetic.mp4"), params, frames=[self.frame])
         self.assertTrue(result.success)
         self.assertIsNotNone(result.polygon)
         polygon = result.polygon
         assert polygon is not None
-        self.assertEqual(len(polygon), 4)
+        self.assertGreaterEqual(len(polygon), 4)
         xs = [pt[0] for pt in polygon]
         ys = [pt[1] for pt in polygon]
         self.assertTrue(all(0 <= x < self.frame.shape[1] for x in xs))
         self.assertTrue(all(0 <= y <= self.frame.shape[0] for y in ys))
         self.assertEqual(result.metrics.get("engine"), "laneatt")
+        self.assertIsNotNone(result.overlay)
 
 
 if __name__ == "__main__":
