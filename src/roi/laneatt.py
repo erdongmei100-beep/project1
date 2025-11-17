@@ -36,6 +36,15 @@ class LaneCandidate:
 
 
 @dataclass
+class LaneCandidate:
+    pts: np.ndarray
+    avg_x: float
+    frame_index: int
+    lanes_on_frame: List[np.ndarray]
+    frame: np.ndarray
+
+
+@dataclass
 class LaneATTParams:
     """LaneATT powered ROI generation configuration."""
 
