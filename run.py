@@ -610,6 +610,7 @@ def main() -> None:
                     "bottom_ratio": laneatt_params.bottom_ratio,
                     "target_lane_index_from_right": laneatt_params.target_lane_index_from_right,
                     "min_lane_frames": laneatt_params.min_lane_frames,
+                    "min_lanes_for_roi": laneatt_params.min_lanes_for_roi,
                     "allow_auto_cv_fallback": laneatt_params.allow_auto_cv_fallback,
                     "save_debug": laneatt_params.save_debug,
                 }

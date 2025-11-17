@@ -43,7 +43,8 @@ roi:
     sample_frames: 18           # LaneATT 推理时抽样的帧数
     bottom_ratio: 0.30          # 仅使用画面底部多少比例的车道点排序（0~1）
     target_lane_index_from_right: 2  # 从右往左选择第几条线作为应急车道分界
-    min_lane_frames: 4          # 至少检测到多少帧车道线才认为成功
+    min_lane_frames: 4          # 记录用途：期待至少有多少帧检测到车道线
+    min_lanes_for_roi: 1        # 只要至少检测到多少条车道线就尝试构造 ROI
     allow_auto_cv_fallback: true  # 失败时是否回退到 auto_cv 逻辑
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:

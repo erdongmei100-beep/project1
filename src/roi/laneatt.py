@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import logging
+
 try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -19,6 +21,18 @@ from .auto_cv import AutoCVParams, AutoCVResult, estimate_roi as estimate_roi_au
 
 Point = Tuple[int, int]
 Polygon = List[Point]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LaneCandidate:
+    pts: np.ndarray
+    avg_x: float
+    frame_index: int
+    lanes_on_frame: List[np.ndarray]
+    frame: np.ndarray
+    detected_lane_count: int
 
 
 @dataclass
@@ -38,6 +52,7 @@ class LaneATTParams:
     bottom_ratio: float = 0.3
     target_lane_index_from_right: int = 2
     min_lane_frames: int = 4
+    min_lanes_for_roi: int = 1
     allow_auto_cv_fallback: bool = True
     save_debug: bool = True
     laneatt: Dict[str, object] = field(default_factory=dict)
@@ -62,6 +77,7 @@ class LaneATTParams:
                 max(1, data.get("target_lane_index_from_right", cls.target_lane_index_from_right))
             ),
             min_lane_frames=int(max(1, data.get("min_lane_frames", cls.min_lane_frames))),
+            min_lanes_for_roi=int(max(1, data.get("min_lanes_for_roi", cls.min_lanes_for_roi))),
             allow_auto_cv_fallback=bool(
                 data.get("allow_auto_cv_fallback", cls.allow_auto_cv_fallback)
             ),
@@ -101,7 +117,7 @@ def _select_target_lane(
     params: LaneATTParams,
     frame_index: int,
     frame: np.ndarray,
-) -> Optional[LaneCandidate]:
+) -> Tuple[Optional[LaneCandidate], int]:
     height, width = frame_shape
     bottom_ratio = float(np.clip(params.bottom_ratio, 0.05, 0.95))
     y_threshold = height * (1.0 - bottom_ratio)
@@ -117,17 +133,23 @@ def _select_target_lane(
         avg_x = float(pts_bottom[:, 0].mean())
         candidates.append((avg_x, pts))
 
-    if len(candidates) < params.target_lane_index_from_right:
-        return None
+    lane_count = len(candidates)
+    if lane_count == 0:
+        return None, lane_count
 
     candidates.sort(key=lambda item: item[0])
-    avg_x, pts = candidates[-params.target_lane_index_from_right]
-    return LaneCandidate(
-        pts=pts,
-        avg_x=float(avg_x),
-        frame_index=frame_index,
-        lanes_on_frame=[np.asarray(lane, dtype=float) for lane in lanes],
-        frame=frame.copy(),
+    target_idx = min(params.target_lane_index_from_right, lane_count)
+    avg_x, pts = candidates[-target_idx]
+    return (
+        LaneCandidate(
+            pts=pts,
+            avg_x=float(avg_x),
+            frame_index=frame_index,
+            lanes_on_frame=[np.asarray(lane, dtype=float) for lane in lanes],
+            frame=frame.copy(),
+            detected_lane_count=lane_count,
+        ),
+        lane_count,
     )
 
 
@@ -164,13 +186,14 @@ def _build_roi_polygon(
     return mask, poly
 
 
-def _draw_debug_overlays(
+def _save_debug(
     frame: np.ndarray,
     lanes: Iterable[np.ndarray],
     selected_lane: Optional[np.ndarray],
     mask: Optional[np.ndarray],
     polygon: Optional[Polygon],
     target_dir: Path,
+    reason: Optional[str] = None,
 ) -> Dict[str, str]:
     target_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time() * 1000)
@@ -194,8 +217,6 @@ def _draw_debug_overlays(
     if selected_lane is not None:
         pts_int = np.round(selected_lane).astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(lanes_img, [pts_int], False, (0, 255, 0), 3)
-    cv2.imwrite(str(lane_path), lanes_img)
-
     roi_img = lanes_img.copy()
     if mask is not None:
         red = np.zeros_like(roi_img)
@@ -203,6 +224,17 @@ def _draw_debug_overlays(
         roi_img = cv2.addWeighted(roi_img, 1.0, red, 0.35, 0)
     if polygon:
         cv2.polylines(roi_img, [np.array(polygon, dtype=np.int32)], True, (0, 0, 255), 2)
+    if reason:
+        cv2.putText(
+            roi_img,
+            f"FAIL: {reason}" if reason != "ok" else "ok",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255) if reason != "ok" else (0, 200, 0),
+            2,
+            cv2.LINE_AA,
+        )
     cv2.imwrite(str(roi_path), roi_img)
 
     return {
@@ -234,10 +266,34 @@ def estimate_roi_laneatt(
         sampled = _sample_frames(video_path, params.sample_frames)
 
     candidates: List[LaneCandidate] = []
+    last_debug_frame: Optional[np.ndarray] = None
+    last_debug_lanes: List[np.ndarray] = []
+    last_selected_lane: Optional[np.ndarray] = None
+    last_reason: Optional[str] = None
+
+    debug_dir = OUTPUTS_DIR / "laneatt"
+    debug_enabled = overlay or params.save_debug
+
     for index, frame in sampled:
         lanes = detector.detect_lanes(frame)
-        candidate = _select_target_lane(lanes, frame.shape[:2], params, index, frame)
+        candidate, lane_count = _select_target_lane(
+            lanes, frame.shape[:2], params, index, frame
+        )
+        last_debug_frame = frame.copy()
+        last_debug_lanes = [np.asarray(lane, dtype=float) for lane in lanes]
+        last_selected_lane = candidate.pts if candidate is not None else None
+        last_reason = "no_lanes_detected" if lane_count == 0 else None
         if candidate is None:
+            if debug_enabled and last_debug_frame is not None:
+                _save_debug(
+                    last_debug_frame,
+                    last_debug_lanes,
+                    last_selected_lane,
+                    None,
+                    None,
+                    debug_dir,
+                    reason=last_reason,
+                )
             continue
         candidates.append(candidate)
 
@@ -245,16 +301,19 @@ def estimate_roi_laneatt(
     chosen: Optional[LaneCandidate] = None
     polygon: Optional[Polygon] = None
     mask: Optional[np.ndarray] = None
-    if len(candidates) < params.min_lane_frames:
-        message = (
-            "laneatt_failed_not_enough_lanes"
-            if candidates
-            else "laneatt_failed_no_lanes"
-        )
+    if not candidates:
+        message = "laneatt_failed_no_lanes"
         success = False
     else:
         candidates.sort(key=lambda cand: cand.avg_x)
         chosen = candidates[len(candidates) // 2]
+        if chosen.detected_lane_count < params.min_lanes_for_roi:
+            logger.warning(
+                "LaneATT ROI: only %d lanes detected (min required %d), trying best-effort ROI",
+                chosen.detected_lane_count,
+                params.min_lanes_for_roi,
+            )
+            last_reason = "not_enough_lanes"
         mask, polygon = _build_roi_polygon(chosen.pts, chosen.frame.shape[:2], params)
         overlay_frame = chosen.frame
         if mask is None or not polygon:
@@ -272,16 +331,29 @@ def estimate_roi_laneatt(
         "laneatt_model_loaded": 1.0 if detector.model_loaded else 0.0,
     }
 
-    if overlay and overlay_frame is not None:
+    if debug_enabled and overlay_frame is not None:
         debug_candidate = chosen or (candidates[-1] if candidates else None)
-        target_dir = overlay_dir or (OUTPUTS_DIR / "laneatt")
-        debug_paths = _draw_debug_overlays(
+        target_dir = overlay_dir or debug_dir
+        debug_paths = _save_debug(
             overlay_frame,
-            debug_candidate.lanes_on_frame if debug_candidate else [],
-            debug_candidate.pts if debug_candidate else None,
-            mask,
+            debug_candidate.lanes_on_frame if debug_candidate else last_debug_lanes,
+            debug_candidate.pts if debug_candidate else last_selected_lane,
+            mask if success else None,
             polygon,
             target_dir,
+            reason="ok" if success else (message or last_reason),
+        )
+        metrics.update({f"debug_{k}": v for k, v in debug_paths.items()})
+    elif debug_enabled and last_debug_frame is not None and (not success or last_reason):
+        target_dir = overlay_dir or debug_dir
+        debug_paths = _save_debug(
+            last_debug_frame,
+            last_debug_lanes,
+            last_selected_lane,
+            None,
+            None,
+            target_dir,
+            reason=message or last_reason,
         )
         metrics.update({f"debug_{k}": v for k, v in debug_paths.items()})
 
