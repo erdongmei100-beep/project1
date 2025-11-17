@@ -47,7 +47,7 @@ roi:
     allow_auto_cv_fallback: true  # 失败时是否回退到 auto_cv 逻辑
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:
-      weights: ''              # LaneATT 权重文件路径，留空则使用启发式回退
+      weights: weights/model_0015.pt              # LaneATT 权重文件路径，留空则使用启发式回退
       device: auto             # 推理设备（auto / cpu / cuda:0 等）
       input_width: null        # 若 LaneATT 输出使用模型输入分辨率，则在此指定宽度以便回缩
       input_height: null       # 若 LaneATT 输出使用模型输入分辨率，则在此指定高度以便回缩
