@@ -41,8 +41,12 @@ roi:
     per_track: true          # 预留：调参脚本是否逐轨迹记录
   laneatt:
     sample_frames: 18           # LaneATT 推理时抽样的帧数
-    bottom_ratio: 0.30          # 仅使用画面底部多少比例的车道点排序（0~1）
+    bottom_ratio: 0.35          # 仅使用画面底部多少比例的车道点排序（0~1）
     target_lane_index_from_right: 2  # 从右往左选择第几条线作为应急车道分界
+    min_bottom_points: 6        # 底部区域参与排序所需的最少点数
+    min_poly_points: 5          # 构造 ROI 多边形时的最少点数（不够则尝试外推）
+    min_roi_area_ratio: 0.01    # ROI 面积占整帧的最小比例
+    allow_hough_fallback: true  # ROI 失败时是否尝试霍夫回退
     min_lane_frames: 4          # 记录用途：期待至少有多少帧检测到车道线
     min_lanes_for_roi: 1        # 只要至少检测到多少条车道线就尝试构造 ROI
     allow_auto_cv_fallback: false  # 失败时是否回退到 auto_cv 逻辑

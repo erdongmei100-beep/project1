@@ -183,6 +183,9 @@ class LaneATTDetector:
         scaled: List[np.ndarray] = []
         for lane in lanes:
             pts = self._scale_to_image(lane.copy(), width, height)
+            pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
+            pts = pts[np.argsort(pts[:, 1])]
             scaled.append(pts)
         self._log_lane_range(scaled, width, height)
         return scaled
