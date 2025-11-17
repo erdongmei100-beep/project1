@@ -31,6 +31,8 @@ class LaneATTConfig:
     hough_max_line_gap: int = 40
     angle_range: Tuple[float, float] = (15.0, 80.0)
     right_lane_only: bool = True
+    input_width: Optional[int] = None
+    input_height: Optional[int] = None
 
     @classmethod
     def from_config(cls, config: Optional[dict]) -> "LaneATTConfig":
@@ -58,6 +60,16 @@ class LaneATTConfig:
             ),
             angle_range=angle_range,
             right_lane_only=bool(data.get("right_lane_only", cls.right_lane_only)),
+            input_width=(
+                int(data["input_width"])
+                if data.get("input_width") not in {None, ""}
+                else None
+            ),
+            input_height=(
+                int(data["input_height"])
+                if data.get("input_height") not in {None, ""}
+                else None
+            ),
         )
 
 
@@ -234,6 +246,18 @@ class LaneATTDetector:
         if 0.0 <= min_x <= 1.0 and 0.0 <= min_y <= 1.0 and max_x <= 1.0 and max_y <= 1.0:
             pts[:, 0] *= max(1.0, width - 1)
             pts[:, 1] *= max(1.0, height - 1)
+        else:
+            # Some LaneATT exports use the model input resolution; rescale to the
+            # original frame size when the configuration provides explicit
+            # dimensions.
+            input_w = self.config.input_width
+            input_h = self.config.input_height
+            if input_w and input_h and (input_w != width or input_h != height):
+                if max_x <= input_w * 1.05 and max_y <= input_h * 1.05:
+                    scale_x = width / float(input_w)
+                    scale_y = height / float(input_h)
+                    pts[:, 0] *= scale_x
+                    pts[:, 1] *= scale_y
 
         pts[:, 0] = np.clip(pts[:, 0], 0, max(0, width - 1))
         pts[:, 1] = np.clip(pts[:, 1], 0, max(0, height - 1))

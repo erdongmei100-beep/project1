@@ -49,6 +49,8 @@ roi:
     laneatt:
       weights: ''              # LaneATT 权重文件路径，留空则使用启发式回退
       device: auto             # 推理设备（auto / cpu / cuda:0 等）
+      input_width: null        # 若 LaneATT 输出使用模型输入分辨率，则在此指定宽度以便回缩
+      input_height: null       # 若 LaneATT 输出使用模型输入分辨率，则在此指定高度以便回缩
       min_length_px: 80        # 车道线最小长度（像素）
       canny_threshold1: 80     # Canny 边缘检测阈值 1（回退模式）
       canny_threshold2: 160    # Canny 边缘检测阈值 2（回退模式）
