@@ -15,7 +15,7 @@ detect:
 
 roi:
   enable: true  # 是否启用 ROI 裁剪逻辑
-  mode: manual  # manual=使用已有 JSON，laneatt=LaneATT 自动生成 ROI，auto_cv=旧版自动估计
+  mode: laneatt  # manual=使用已有 JSON，laneatt=LaneATT 自动生成 ROI，auto_cv=旧版自动估计
   dir: data/rois  # ROI 输出目录，建议加入 .gitignore，pull 后需重新生成
   path: ""  # 兼容旧配置，若提供则覆盖 dir 推导的路径
   auto_cv:
@@ -49,7 +49,7 @@ roi:
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:
       weights: weights/model_0015.pt              # LaneATT 权重文件路径，留空则使用启发式回退
-      device: auto             # 推理设备（auto / cpu / cuda:0 等）
+      device: cpu             # 推理设备（auto / cpu / cuda:0 等）
       input_width: null        # 若 LaneATT 输出使用模型输入分辨率，则在此指定宽度以便回缩
       input_height: null       # 若 LaneATT 输出使用模型输入分辨率，则在此指定高度以便回缩
       min_length_px: 80        # 车道线最小长度（像素）
