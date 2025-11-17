@@ -150,6 +150,31 @@ class LaneATTDetector:
         lanes = self._detect_fallback(image)
         return LaneDetectionResult(lanes=lanes, model_loaded=self._model_ready)
 
+    def detect_lanes(self, image: np.ndarray) -> List[np.ndarray]:
+        """Return lane polylines in image coordinates.
+
+        The fallback implementation returns simple two-point polylines.  When
+        the model produces normalised or resized coordinates they are scaled
+        back to the original frame size to keep ROI construction consistent
+        with the rendered image.
+        """
+
+        if image is None or image.size == 0:
+            return []
+
+        # TODO: replace with the real LaneATT inference path when the model
+        # weights and architecture are available.
+        detections = self._detect_fallback(image)
+
+        lanes = [np.array(lane.points, dtype=float) for lane in detections]
+        height, width = image.shape[:2]
+        scaled: List[np.ndarray] = []
+        for lane in lanes:
+            pts = self._scale_to_image(lane.copy(), width, height)
+            scaled.append(pts)
+        self._log_lane_range(scaled, width, height)
+        return scaled
+
     # Fallback lane detector used in tests and when PyTorch is not
     # available.  The method is intentionally verbose to keep the maths
     # transparent for future maintainers.
@@ -198,3 +223,32 @@ class LaneATTDetector:
         if len(lanes) <= 2:
             return lanes
         return lanes[:2]
+
+    def _scale_to_image(self, pts: np.ndarray, width: int, height: int) -> np.ndarray:
+        if pts.size == 0:
+            return pts
+        max_x, max_y = float(np.max(pts[:, 0])), float(np.max(pts[:, 1]))
+        min_x, min_y = float(np.min(pts[:, 0])), float(np.min(pts[:, 1]))
+
+        # Normalised coordinates in the [0, 1] range.
+        if 0.0 <= min_x <= 1.0 and 0.0 <= min_y <= 1.0 and max_x <= 1.0 and max_y <= 1.0:
+            pts[:, 0] *= max(1.0, width - 1)
+            pts[:, 1] *= max(1.0, height - 1)
+
+        pts[:, 0] = np.clip(pts[:, 0], 0, max(0, width - 1))
+        pts[:, 1] = np.clip(pts[:, 1], 0, max(0, height - 1))
+        return pts
+
+    def _log_lane_range(self, lanes: List[np.ndarray], width: int, height: int) -> None:
+        if not lanes:
+            return
+        max_x = max(float(np.max(l[:, 0])) for l in lanes)
+        max_y = max(float(np.max(l[:, 1])) for l in lanes)
+        min_x = min(float(np.min(l[:, 0])) for l in lanes)
+        min_y = min(float(np.min(l[:, 1])) for l in lanes)
+        if max_x > width * 1.05 or max_y > height * 1.05:
+            print(
+                "[LaneATTDetector] Warning: lane coordinates exceed frame size,"
+                f" min=({min_x:.1f}, {min_y:.1f}) max=({max_x:.1f}, {max_y:.1f})"
+                f" frame=({width}, {height})"
+            )
