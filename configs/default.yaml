@@ -45,7 +45,7 @@ roi:
     target_lane_index_from_right: 2  # 从右往左选择第几条线作为应急车道分界
     min_lane_frames: 4          # 记录用途：期待至少有多少帧检测到车道线
     min_lanes_for_roi: 1        # 只要至少检测到多少条车道线就尝试构造 ROI
-    allow_auto_cv_fallback: true  # 失败时是否回退到 auto_cv 逻辑
+    allow_auto_cv_fallback: false  # 失败时是否回退到 auto_cv 逻辑
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:
       weights: weights/model_0015.pt              # LaneATT 权重文件路径，留空则使用启发式回退
