@@ -72,6 +72,12 @@ python run.py \
 
 程序会将输出写入 `data/outputs/<视频名>/` 下的子目录，终端会打印每个生成文件的完整路径。
 
+### 配置说明
+
+- 默认模型权重位于 `weights/` 目录，可根据需要替换。
+- 主要配置文件为 `configs/default.yaml`，可根据需求调整。
+- 如需启用 LaneATT 自动 ROI 生成，将 `roi.mode` 设为 `laneatt`（例如 `roi.mode: laneatt`），并确保 `roi.enable: true`。保持 `laneatt.allow_auto_cv_fallback: true` 时，若 LaneATT 失败将自动回退到旧版 AutoCV 逻辑。
+
 ## 车牌检测权重
 
 默认权重路径为 `weights/plate/yolov8n-plate.pt`。若文件缺失：
