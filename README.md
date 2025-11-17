@@ -145,12 +145,25 @@ python -m project.tools.roi_auto_cv \
 3. 叠加图是否明显偏离车道线，据此手动调整 `crop_right`、`crop_bottom` 等裁剪参数。
 4. 极端素材（例如 `exceptional_case.mp4`）中车道线往往位于画面更右侧且对比度较低，脚本会自动尝试放宽裁剪区域与角度阈值；若仍失败，将弹出手动 ROI 标注窗口。
 
-手动模式说明：自动检测失败时会弹出一个窗口，左上角会展示中文提示。按以下操作即可快速标注：
+### 手动 ROI 使用说明
 
-- 鼠标左键：按顺序点击多边形顶点。
-- 鼠标右键：撤销上一个顶点。
-- 按 `R`：清空当前标注重新开始。
-- 按 `S`：保存当前多边形（至少三个点）。
-- 按 `Q` 或 `Esc`：退出手动标注。
+自动检测失败时或需要自行修正时，可以运行 `tools/roi_annotator.py` 进行手工标注：
+
+```bash
+python tools/roi_annotator.py --image data/frames/2_000123.jpg --save data/rois/2.json
+# 或从视频中抽帧
+python tools/roi_annotator.py --video data/videos/2.mp4 --frame 160 --save data/rois/2.json
+```
+
+窗口默认缩放到屏幕约 80% 高度，支持缩放、平移与一键适配（`F`）。所有保存的坐标均为原图坐标，格式与主程序读取的 JSON 相同：`{"polygon": [[x, y], ...], "image_wh": [W, H], "mode": "manual"}`。
+
+快捷键与鼠标操作：
+
+- 鼠标左键：添加顶点。
+- 鼠标右键或 Backspace：撤销上一个顶点；按住右键或中键拖动可平移视图。
+- 滚轮：以指针为中心缩放；`F` 适配整图。
+- `C`：清空当前标注。
+- `Enter` / `Space`：完成并保存（至少三个点）。
+- `Esc` / `Q`：退出不保存。
 
 欢迎提交问题或改进建议。
