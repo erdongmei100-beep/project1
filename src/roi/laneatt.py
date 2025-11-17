@@ -32,16 +32,7 @@ class LaneCandidate:
     frame_index: int
     lanes_on_frame: List[np.ndarray]
     frame: np.ndarray
-    detected_lane_count: int
-
-
-@dataclass
-class LaneCandidate:
-    pts: np.ndarray
-    avg_x: float
-    frame_index: int
-    lanes_on_frame: List[np.ndarray]
-    frame: np.ndarray
+    detected_lane_count: Optional[int] = None
 
 
 @dataclass
@@ -217,6 +208,7 @@ def _save_debug(
     if selected_lane is not None:
         pts_int = np.round(selected_lane).astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(lanes_img, [pts_int], False, (0, 255, 0), 3)
+    cv2.imwrite(str(lane_path), lanes_img)
     roi_img = lanes_img.copy()
     if mask is not None:
         red = np.zeros_like(roi_img)
