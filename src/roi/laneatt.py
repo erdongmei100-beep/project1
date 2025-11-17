@@ -1,12 +1,12 @@
 """Emergency lane ROI generation using LaneATT lane detection."""
 from __future__ import annotations
 
-import math
-import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import logging
 
 try:
     import cv2  # type: ignore
@@ -14,13 +14,25 @@ except Exception:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore
 import numpy as np
 
-from lane_detection.laneatt import LaneATTConfig, LaneATTDetector, LaneDetection
+from lane_detection.laneatt import LaneATTConfig, LaneATTDetector
 
 from src.utils.paths import OUTPUTS_DIR
-from .auto_cv import AutoCVParams, AutoCVResult, DetectedLine
+from .auto_cv import AutoCVParams, AutoCVResult, estimate_roi as estimate_roi_auto
 
 Point = Tuple[int, int]
 Polygon = List[Point]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LaneCandidate:
+    pts: np.ndarray
+    avg_x: float
+    frame_index: int
+    lanes_on_frame: List[np.ndarray]
+    frame: np.ndarray
+    detected_lane_count: int
 
 
 @dataclass
@@ -28,11 +40,10 @@ class LaneATTParams:
     """LaneATT powered ROI generation configuration."""
 
     sample_frames: int = 18
-    top_ratio: float = 0.33
-    bottom_margin: int = 18
-    buffer: int = 10
-    min_score: float = 0.05
+    bottom_ratio: float = 0.3
+    target_lane_index_from_right: int = 2
     min_lane_frames: int = 4
+    min_lanes_for_roi: int = 1
     allow_auto_cv_fallback: bool = True
     save_debug: bool = True
     laneatt: Dict[str, object] = field(default_factory=dict)
@@ -43,13 +54,21 @@ class LaneATTParams:
         laneatt_cfg = data.get("laneatt") or {}
         if isinstance(laneatt_cfg, (str, Path)):
             laneatt_cfg = {"weights": str(laneatt_cfg)}
+        bottom_ratio_cfg = data.get("bottom_ratio", cls.bottom_ratio)
+        if "bottom_ratio" not in data and "top_ratio" in data:
+            try:
+                bottom_ratio_cfg = 1.0 - float(data["top_ratio"])
+            except Exception:
+                bottom_ratio_cfg = cls.bottom_ratio
+
         params = cls(
             sample_frames=int(data.get("sample_frames", cls.sample_frames)),
-            top_ratio=float(np.clip(data.get("top_ratio", cls.top_ratio), 0.05, 0.9)),
-            bottom_margin=int(max(0, data.get("bottom_margin", cls.bottom_margin))),
-            buffer=int(max(0, data.get("buffer", cls.buffer))),
-            min_score=float(max(0.0, data.get("min_score", cls.min_score))),
+            bottom_ratio=float(np.clip(bottom_ratio_cfg, 0.05, 0.9)),
+            target_lane_index_from_right=int(
+                max(1, data.get("target_lane_index_from_right", cls.target_lane_index_from_right))
+            ),
             min_lane_frames=int(max(1, data.get("min_lane_frames", cls.min_lane_frames))),
+            min_lanes_for_roi=int(max(1, data.get("min_lanes_for_roi", cls.min_lanes_for_roi))),
             allow_auto_cv_fallback=bool(
                 data.get("allow_auto_cv_fallback", cls.allow_auto_cv_fallback)
             ),
@@ -83,79 +102,137 @@ def _sample_frames(video_path: Path, sample_frames: int) -> List[Tuple[int, np.n
     return frames
 
 
-def _aggregate_lane(lanes: Iterable[LaneDetection]) -> Optional[DetectedLine]:
-    lanes = list(lanes)
-    if not lanes:
-        return None
-    bottom_points = [lane.bottom_point for lane in lanes]
-    top_points = [lane.top_point for lane in lanes]
-    xs_bottom = [pt[0] for pt in bottom_points]
-    ys_bottom = [pt[1] for pt in bottom_points]
-    xs_top = [pt[0] for pt in top_points]
-    ys_top = [pt[1] for pt in top_points]
-    bottom_x = statistics.median(xs_bottom)
-    bottom_y = statistics.median(ys_bottom)
-    top_x = statistics.median(xs_top)
-    top_y = statistics.median(ys_top)
-    if top_y == bottom_y:
-        return None
-    m = (bottom_y - top_y) / max(1e-3, (bottom_x - top_x))
-    b = bottom_y - m * bottom_x
-    angle = math.degrees(math.atan2(bottom_y - top_y, bottom_x - top_x))
-    length = math.hypot(bottom_x - top_x, bottom_y - top_y)
-    score = statistics.mean(lane.score for lane in lanes)
-    points = ((int(top_x), int(top_y)), (int(bottom_x), int(bottom_y)))
-    return DetectedLine(
-        m=float(m),
-        b=float(b),
-        score=float(score),
-        length=float(length),
-        angle=float(abs(angle)),
-        x_bottom=float(bottom_x),
-        frame_index=-1,
-        points=points,
+def _select_target_lane(
+    lanes: Iterable[np.ndarray],
+    frame_shape: Tuple[int, int],
+    params: LaneATTParams,
+    frame_index: int,
+    frame: np.ndarray,
+) -> Tuple[Optional[LaneCandidate], int]:
+    height, width = frame_shape
+    bottom_ratio = float(np.clip(params.bottom_ratio, 0.05, 0.95))
+    y_threshold = height * (1.0 - bottom_ratio)
+    candidates: List[Tuple[float, np.ndarray]] = []
+
+    for lane in lanes:
+        if lane.ndim != 2 or lane.shape[1] != 2:
+            continue
+        pts = np.asarray(lane, dtype=float)
+        pts_bottom = pts[pts[:, 1] >= y_threshold]
+        if len(pts_bottom) == 0:
+            continue
+        avg_x = float(pts_bottom[:, 0].mean())
+        candidates.append((avg_x, pts))
+
+    lane_count = len(candidates)
+    if lane_count == 0:
+        return None, lane_count
+
+    candidates.sort(key=lambda item: item[0])
+    target_idx = min(params.target_lane_index_from_right, lane_count)
+    avg_x, pts = candidates[-target_idx]
+    return (
+        LaneCandidate(
+            pts=pts,
+            avg_x=float(avg_x),
+            frame_index=frame_index,
+            lanes_on_frame=[np.asarray(lane, dtype=float) for lane in lanes],
+            frame=frame.copy(),
+            detected_lane_count=lane_count,
+        ),
+        lane_count,
     )
 
 
-def _build_polygon(
-    line: DetectedLine,
-    frame_shape: Tuple[int, int],
-    params: LaneATTParams,
-) -> Polygon:
+def _build_roi_polygon(
+    lane_pts: np.ndarray, frame_shape: Tuple[int, int], params: LaneATTParams
+) -> Tuple[Optional[np.ndarray], Optional[Polygon]]:
     height, width = frame_shape
-    top_candidate = max(0, min(height - 1, int(line.points[0][1])))
-    max_top = max(0, min(height - 1, int(height * params.top_ratio)))
-    top_y = min(top_candidate, max_top)
-    bottom_y = height - 1 - params.bottom_margin
-    bottom_y = max(top_y + 10, min(height - 1, bottom_y))
+    bottom_ratio = float(np.clip(params.bottom_ratio, 0.05, 0.95))
+    y_top = int(height * (1.0 - bottom_ratio))
 
-    def clamp_x(x: float) -> int:
-        return int(max(0, min(width - 1, x)))
+    pts = np.asarray(lane_pts, dtype=float)
+    lane_segment = pts[pts[:, 1] >= y_top]
+    if len(lane_segment) < 2:
+        return None, None
 
-    top_x = clamp_x(line.points[0][0] + params.buffer)
-    bottom_x = clamp_x(line.points[1][0] + params.buffer)
-    polygon = [
-        (bottom_x, bottom_y),
-        (width - 1, bottom_y),
-        (width - 1, top_y),
-        (top_x, top_y),
+    # Sort from bottom to top to construct a polygon that hugs the lane line.
+    lane_segment = lane_segment[np.argsort(-lane_segment[:, 1])]
+
+    poly: Polygon = []
+    for x, y in lane_segment:
+        poly.append((int(round(x)), int(round(y))))
+
+    top_y = int(round(lane_segment[-1][1]))
+
+    # Close the polygon along the right border – avoids the previous bug that
+    # produced a vertical strip from an averaged x position.
+    poly.append((width - 1, top_y))
+    poly.append((width - 1, height - 1))
+    poly.append((int(round(lane_segment[0][0])), height - 1))
+
+    poly_np = np.array(poly, dtype=np.int32)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [poly_np], 1)
+    return mask, poly
+
+
+def _save_debug(
+    frame: np.ndarray,
+    lanes: Iterable[np.ndarray],
+    selected_lane: Optional[np.ndarray],
+    mask: Optional[np.ndarray],
+    polygon: Optional[Polygon],
+    target_dir: Path,
+    reason: Optional[str] = None,
+) -> Dict[str, str]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time() * 1000)
+    raw_path = target_dir / f"laneatt_raw_{timestamp}.jpg"
+    lane_path = target_dir / f"laneatt_lanes_{timestamp}.jpg"
+    roi_path = target_dir / f"laneatt_roi_{timestamp}.jpg"
+
+    cv2.imwrite(str(raw_path), frame)
+
+    lanes_img = frame.copy()
+    color_cycle = [
+        (255, 0, 0),
+        (0, 255, 255),
+        (255, 0, 255),
+        (0, 165, 255),
+        (255, 255, 0),
     ]
-    return polygon
-
-
-def _render_overlay(frame: np.ndarray, polygon: Polygon, line: Optional[DetectedLine]) -> np.ndarray:
-    overlay = frame.copy()
-    if line is not None:
-        cv2.line(overlay, line.points[0], line.points[1], (0, 255, 0), 2)
+    for idx, lane in enumerate(lanes):
+        pts_int = np.round(lane).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(lanes_img, [pts_int], False, color_cycle[idx % len(color_cycle)], 2)
+    if selected_lane is not None:
+        pts_int = np.round(selected_lane).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(lanes_img, [pts_int], False, (0, 255, 0), 3)
+    roi_img = lanes_img.copy()
+    if mask is not None:
+        red = np.zeros_like(roi_img)
+        red[:, :, 2] = (mask * 200).astype(np.uint8)
+        roi_img = cv2.addWeighted(roi_img, 1.0, red, 0.35, 0)
     if polygon:
-        cv2.polylines(overlay, [np.array(polygon, dtype=np.int32)], True, (0, 0, 255), 2)
-        cv2.fillPoly(
-            overlay,
-            [np.array(polygon, dtype=np.int32)],
-            color=(0, 0, 255),
-            lineType=cv2.LINE_AA,
+        cv2.polylines(roi_img, [np.array(polygon, dtype=np.int32)], True, (0, 0, 255), 2)
+    if reason:
+        cv2.putText(
+            roi_img,
+            f"FAIL: {reason}" if reason != "ok" else "ok",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255) if reason != "ok" else (0, 200, 0),
+            2,
+            cv2.LINE_AA,
         )
-    return overlay
+    cv2.imwrite(str(roi_path), roi_img)
+
+    return {
+        "raw": str(raw_path),
+        "lanes": str(lane_path),
+        "roi": str(roi_path),
+    }
 
 
 def estimate_roi_laneatt(
@@ -178,62 +255,121 @@ def estimate_roi_laneatt(
         sampled = list(enumerate(frames))
     else:
         sampled = _sample_frames(video_path, params.sample_frames)
-    used_frames: List[int] = []
-    detections: List[LaneDetection] = []
-    overlay_image: Optional[np.ndarray] = None
+
+    candidates: List[LaneCandidate] = []
+    last_debug_frame: Optional[np.ndarray] = None
+    last_debug_lanes: List[np.ndarray] = []
+    last_selected_lane: Optional[np.ndarray] = None
+    last_reason: Optional[str] = None
+
+    debug_dir = OUTPUTS_DIR / "laneatt"
+    debug_enabled = overlay or params.save_debug
+
     for index, frame in sampled:
-        result = detector.detect(frame)
-        best = result.best_lane
-        if best is None:
-            continue
-        if best.score < params.min_score:
-            continue
-        detections.append(best)
-        used_frames.append(index)
-        overlay_image = frame
-    if len(detections) < params.min_lane_frames:
-        message = (
-            "laneatt_failed_not_enough_lanes"
-            if detections
-            else "laneatt_failed_no_lanes"
+        lanes = detector.detect_lanes(frame)
+        candidate, lane_count = _select_target_lane(
+            lanes, frame.shape[:2], params, index, frame
         )
+        last_debug_frame = frame.copy()
+        last_debug_lanes = [np.asarray(lane, dtype=float) for lane in lanes]
+        last_selected_lane = candidate.pts if candidate is not None else None
+        last_reason = "no_lanes_detected" if lane_count == 0 else None
+        if candidate is None:
+            if debug_enabled and last_debug_frame is not None:
+                _save_debug(
+                    last_debug_frame,
+                    last_debug_lanes,
+                    last_selected_lane,
+                    None,
+                    None,
+                    debug_dir,
+                    reason=last_reason,
+                )
+            continue
+        candidates.append(candidate)
+
+    overlay_frame: Optional[np.ndarray] = None
+    chosen: Optional[LaneCandidate] = None
+    polygon: Optional[Polygon] = None
+    mask: Optional[np.ndarray] = None
+    if not candidates:
+        message = "laneatt_failed_no_lanes"
         success = False
-        polygon = None
-        detected_line = None
     else:
-        detected_line = _aggregate_lane(detections)
-        if detected_line is None:
+        candidates.sort(key=lambda cand: cand.avg_x)
+        chosen = candidates[len(candidates) // 2]
+        if chosen.detected_lane_count < params.min_lanes_for_roi:
+            logger.warning(
+                "LaneATT ROI: only %d lanes detected (min required %d), trying best-effort ROI",
+                chosen.detected_lane_count,
+                params.min_lanes_for_roi,
+            )
+            last_reason = "not_enough_lanes"
+        mask, polygon = _build_roi_polygon(chosen.pts, chosen.frame.shape[:2], params)
+        overlay_frame = chosen.frame
+        if mask is None or not polygon:
             success = False
-            polygon = None
             message = "laneatt_failed_geometry"
         else:
-            polygon = _build_polygon(detected_line, overlay_image.shape[:2], params)  # type: ignore[arg-type]
             success = True
             message = ""
+
     duration = time.time() - start
     metrics: Dict[str, float] = {
         "duration": float(duration),
-        "lanes_detected": float(len(detections)),
+        "lanes_detected": float(len(candidates)),
         "engine": "laneatt",
         "laneatt_model_loaded": 1.0 if detector.model_loaded else 0.0,
     }
-    if overlay and overlay_image is not None and polygon:
-        overlay_img = _render_overlay(overlay_image, polygon, detected_line)
-        target_dir = overlay_dir or (OUTPUTS_DIR / "laneatt")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        overlay_path = target_dir / f"laneatt_{int(time.time())}.jpg"
-        cv2.imwrite(str(overlay_path), overlay_img)
-        metrics["overlay_path"] = str(overlay_path)
+
+    if debug_enabled and overlay_frame is not None:
+        debug_candidate = chosen or (candidates[-1] if candidates else None)
+        target_dir = overlay_dir or debug_dir
+        debug_paths = _save_debug(
+            overlay_frame,
+            debug_candidate.lanes_on_frame if debug_candidate else last_debug_lanes,
+            debug_candidate.pts if debug_candidate else last_selected_lane,
+            mask if success else None,
+            polygon,
+            target_dir,
+            reason="ok" if success else (message or last_reason),
+        )
+        metrics.update({f"debug_{k}": v for k, v in debug_paths.items()})
+    elif debug_enabled and last_debug_frame is not None and (not success or last_reason):
+        target_dir = overlay_dir or debug_dir
+        debug_paths = _save_debug(
+            last_debug_frame,
+            last_debug_lanes,
+            last_selected_lane,
+            None,
+            None,
+            target_dir,
+            reason=message or last_reason,
+        )
+        metrics.update({f"debug_{k}": v for k, v in debug_paths.items()})
+
     result = AutoCVResult(
         success=success,
         polygon=polygon,
-        base_size=(overlay_image.shape[1], overlay_image.shape[0]) if overlay_image is not None else (0, 0),
-        used_frames=used_frames,
-        line=detected_line,
+        base_size=(
+            (overlay_frame.shape[1], overlay_frame.shape[0]) if overlay_frame is not None else (0, 0)
+        ),
+        used_frames=[cand.frame_index for cand in candidates],
+        line=None,
         params_used=AutoCVParams() if auto_cv_params is None else auto_cv_params,
         metrics=metrics,
         duration=duration,
         message=message,
-        overlay=None,
+        overlay=mask,
     )
-    return result
+
+    if success or not params.allow_auto_cv_fallback:
+        return result
+
+    print("[LaneATT ROI] Falling back to auto_cv due to detection failure")
+    return estimate_roi_auto(
+        video_path,
+        auto_cv_params or AutoCVParams(),
+        overlay=overlay,
+        overlay_dir=overlay_dir,
+    )
