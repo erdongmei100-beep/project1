@@ -103,6 +103,54 @@ def _sample_frames(video_path: Path, sample_frames: int) -> List[Tuple[int, np.n
     return frames
 
 
+def _rescale_lane_points(
+    lanes: Sequence[LaneDetection], frame_shape: Tuple[int, int]
+) -> List[LaneDetection]:
+    """Convert LaneATT coordinates to pixel space when needed."""
+
+    if not lanes:
+        return []
+    height, width = frame_shape
+    if height <= 0 or width <= 0:
+        return list(lanes)
+    xs = [abs(float(pt[0])) for lane in lanes for pt in lane.points]
+    ys = [abs(float(pt[1])) for lane in lanes for pt in lane.points]
+    max_x = max(xs) if xs else 0.0
+    max_y = max(ys) if ys else 0.0
+    normalized_x = max_x <= 3.0
+    normalized_y = max_y <= 3.0
+    if not normalized_x and not normalized_y:
+        return list(lanes)
+
+    def clamp(value: float, limit: int) -> int:
+        if limit <= 1:
+            return int(round(value))
+        return int(max(0.0, min(limit - 1, value)))
+
+    scaled: List[LaneDetection] = []
+    for lane in lanes:
+        points: List[Point] = []
+        for x, y in lane.points:
+            scaled_x = float(x) * width if normalized_x else float(x)
+            scaled_y = float(y) * height if normalized_y else float(y)
+            points.append((clamp(scaled_x, width), clamp(scaled_y, height)))
+        scaled.append(
+            LaneDetection(
+                points=tuple(points),
+                length=lane.length,
+                angle=lane.angle,
+                score=lane.score,
+            )
+        )
+    print(
+        (
+            f"[LaneATT] Rescaled {len(lanes)} lane(s) using frame size "
+            f"{width}x{height} (normalized_x={normalized_x}, normalized_y={normalized_y})."
+        )
+    )
+    return scaled
+
+
 def _aggregate_lane(lanes: Iterable[LaneDetection]) -> Optional[DetectedLine]:
     lanes = list(lanes)
     if not lanes:
@@ -156,7 +204,7 @@ def _build_polygon(
     top_x = clamp_x(line.points[0][0] + params.buffer)
     bottom_x = clamp_x(line.points[1][0] + params.buffer)
     if lane_width_px is not None and lane_width_px > 0:
-        lane_w = max(params.min_roi_width_px, lane_width_px * params.emergency_width_factor)
+        lane_w = max(params.min_roi_width_px, lane_width_px)
     else:
         default_lane_w = width * params.fallback_lane_width_ratio
         lane_w = max(params.min_roi_width_px, default_lane_w)
@@ -168,7 +216,40 @@ def _build_polygon(
         (right_x, top_y),
         (top_x, top_y),
     ]
+    width_float = float(max(1, width))
+    roi_width = right_x - bottom_x
+    print(
+        (
+            f"[LaneATT] ROI bounds -> left: {bottom_x}px ({bottom_x / width_float:.3f}), "
+            f"right: {right_x}px ({right_x / width_float:.3f}), "
+            f"width: {roi_width}px ({roi_width / width_float:.3f})."
+        )
+    )
     return polygon
+
+
+def _resolve_lane_width(
+    lane_width_raw_px: Optional[float], frame_width: int, params: LaneATTParams
+) -> float:
+    """Return the final lane width while guarding against implausible values."""
+
+    raw_for_calc = lane_width_raw_px
+    if raw_for_calc is not None and not (30.0 <= raw_for_calc <= 1000.0):
+        print(
+            (
+                f"[LaneATT] WARNING: lane_width_raw_px={raw_for_calc:.2f} outside "
+                "expected range; falling back to default width."
+            )
+        )
+        raw_for_calc = None
+    if raw_for_calc is not None:
+        lane_width_final_px = max(
+            params.min_roi_width_px, raw_for_calc * params.emergency_width_factor
+        )
+    else:
+        default_lane_w = frame_width * params.fallback_lane_width_ratio
+        lane_width_final_px = max(params.min_roi_width_px, default_lane_w)
+    return lane_width_final_px
 
 
 def _render_overlay(frame: np.ndarray, polygon: Polygon, line: Optional[DetectedLine]) -> np.ndarray:
@@ -208,7 +289,7 @@ def estimate_roi_laneatt(
         sampled = _sample_frames(video_path, params.sample_frames)
     used_frames: List[int] = []
     detections: List[LaneDetection] = []
-    all_lane_bottom_xs: List[List[float]] = []
+    lane_width_samples: List[float] = []
     overlay_image: Optional[np.ndarray] = None
     lane_width_raw_px: Optional[float] = None
     lane_width_final_px: Optional[float] = None
@@ -221,10 +302,27 @@ def estimate_roi_laneatt(
         ]
         if not lanes:
             continue
-        lanes.sort(key=lambda lane: lane.bottom_point[0])
-        all_lane_bottom_xs.append([lane.bottom_point[0] for lane in lanes])
-        rightmost = lanes[-1]
-        detections.append(rightmost)
+        scaled_lanes = _rescale_lane_points(lanes, frame.shape[:2])
+        if not scaled_lanes:
+            continue
+        scaled_lanes.sort(key=lambda lane: lane.bottom_point[0])
+        bottom_xs = [lane.bottom_point[0] for lane in scaled_lanes]
+        bottom_str = ", ".join(f"{idx}:{x:.1f}" for idx, x in enumerate(bottom_xs))
+        print(f"[LaneATT] Frame {index}: lane bottom_x values -> {bottom_str}")
+        if len(bottom_xs) >= 2:
+            width_sample = bottom_xs[-1] - bottom_xs[-2]
+            if width_sample > 0:
+                lane_width_samples.append(width_sample)
+                print(
+                    f"[LaneATT] Frame {index}: right-lane width sample = {width_sample:.2f}px"
+                )
+        reference_idx = len(scaled_lanes) - 2 if len(scaled_lanes) >= 2 else len(scaled_lanes) - 1
+        reference_lane = scaled_lanes[reference_idx]
+        print(
+            f"[LaneATT] Frame {index}: selected lane idx={reference_idx}, "
+            f"bottom_x={reference_lane.bottom_point[0]:.1f}"
+        )
+        detections.append(reference_lane)
         used_frames.append(index)
         overlay_image = frame
     if len(detections) < params.min_lane_frames:
@@ -243,26 +341,18 @@ def estimate_roi_laneatt(
             polygon = None
             message = "laneatt_failed_geometry"
         else:
-            lane_widths: List[float] = []
-            for xs in all_lane_bottom_xs:
-                xs = sorted(xs)
-                if len(xs) >= 2:
-                    lane_widths.extend(xs[i] - xs[i - 1] for i in range(1, len(xs)))
-            lane_width_raw_px = statistics.median(lane_widths) if lane_widths else None
+            lane_width_raw_px = (
+                statistics.median(lane_width_samples) if lane_width_samples else None
+            )
             _frame_height, frame_width = overlay_image.shape[:2]  # type: ignore[misc]
-            if lane_width_raw_px is not None and lane_width_raw_px > 0:
-                lane_width_final_px = max(
-                    params.min_roi_width_px,
-                    lane_width_raw_px * params.emergency_width_factor,
-                )
-            else:
-                default_lane_w = frame_width * params.fallback_lane_width_ratio
-                lane_width_final_px = max(params.min_roi_width_px, default_lane_w)
+            lane_width_final_px = _resolve_lane_width(
+                lane_width_raw_px, frame_width, params
+            )
             polygon = _build_polygon(
                 detected_line,
                 overlay_image.shape[:2],  # type: ignore[arg-type]
                 params,
-                lane_width_px=lane_width_raw_px,
+                lane_width_px=lane_width_final_px,
             )
             success = True
             message = ""
