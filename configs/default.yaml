@@ -15,7 +15,7 @@ detect:
 
 roi:
   enable: true  # 是否启用 ROI 裁剪逻辑
-  mode: manual  # manual=使用已有 JSON，laneatt=LaneATT 自动生成 ROI，auto_cv=旧版自动估计
+  mode: laneatt  # manual=使用已有 JSON，laneatt=LaneATT 自动生成 ROI，auto_cv=旧版自动估计
   dir: data/rois  # ROI 输出目录，建议加入 .gitignore，pull 后需重新生成
   path: ""  # 兼容旧配置，若提供则覆盖 dir 推导的路径
   auto_cv:
@@ -46,10 +46,10 @@ roi:
     buffer: 12                  # ROI 相对车道线向右偏移的像素
     min_score: 0.05             # 接受的 LaneATT 最小置信度
     min_lane_frames: 4          # 至少检测到多少帧车道线才认为成功
-    allow_auto_cv_fallback: true  # 失败时是否回退到 auto_cv 逻辑
+    allow_auto_cv_fallback: false  # 失败时是否回退到 auto_cv 逻辑
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:
-      weights: ''              # LaneATT 权重文件路径，留空则使用启发式回退
+      weights: weights/model_0015.pt              # LaneATT 权重文件路径，留空则使用启发式回退
       device: auto             # 推理设备（auto / cpu / cuda:0 等）
       min_length_px: 80        # 车道线最小长度（像素）
       canny_threshold1: 80     # Canny 边缘检测阈值 1（回退模式）
