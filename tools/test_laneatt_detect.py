@@ -11,6 +11,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -60,10 +61,19 @@ def _read_frame(video_path: Path, frame_idx: int) -> Optional[Tuple[int, Any]]:
     return frame_idx, frame
 
 
-def _draw_lanes(frame, lanes: Sequence[LaneDetection]) -> Any:
+def _draw_lanes(
+    frame,
+    lanes: Sequence[LaneDetection],
+    trusted_min_score: Optional[float] = None,
+) -> Any:
     vis = frame.copy()
     height, width = frame.shape[:2]
     for idx, lane in enumerate(lanes):
+        score = float(getattr(lane, "score", 1.0))
+        if trusted_min_score is not None and score < trusted_min_score:
+            color = (0, 255, 255)
+        else:
+            color = LANE_COLOR
         out_of_bounds = False
         for point in lane.points:
             x, y = point
@@ -71,23 +81,29 @@ def _draw_lanes(frame, lanes: Sequence[LaneDetection]) -> Any:
                 print(
                     (
                         "[LaneATT] WARNING: lane with score "
-                        f"{lane.score:.3f} has out-of-bounds point {point}"
+                        f"{score:.3f} has out-of-bounds point {point}"
                         f" for frame size {width}x{height}."
                     )
                 )
                 out_of_bounds = True
                 break
-        cv2.line(vis, lane.points[0], lane.points[1], LANE_COLOR, 3)
+        cv2.line(vis, lane.points[0], lane.points[1], color, 3)
         bottom = lane.bottom_point
-        label = f"{idx}:{int(bottom[0])}"
-        cv2.circle(vis, bottom, 4, LANE_COLOR, -1)
+        length_px = int(
+            math.hypot(
+                lane.top_point[0] - lane.bottom_point[0],
+                lane.top_point[1] - lane.bottom_point[1],
+            )
+        )
+        label = f"{idx}:s={score:.2f},L={length_px}"
+        cv2.circle(vis, bottom, 4, color, -1)
         cv2.putText(
             vis,
             label,
             (int(bottom[0]), int(bottom[1]) - 6),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            LANE_COLOR,
+            color,
             1,
             cv2.LINE_AA,
         )
@@ -121,6 +137,15 @@ def parse_args() -> argparse.Namespace:
         help="Directory for per-frame lane visualisation",
     )
     parser.add_argument("--device", default=None, help="Override lane detector device")
+    parser.add_argument(
+        "--vis-min-score",
+        type=float,
+        default=None,
+        help=(
+            "Minimum LaneATT score for lane visualisation only. "
+            "Defaults to the ROI min_score from config if not set."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -134,6 +159,9 @@ def main() -> None:
     roi_cfg["laneatt"] = laneatt_cfg
 
     params = LaneATTParams.from_config(roi_cfg)
+    vis_min_score = (
+        float(args.vis_min_score) if args.vis_min_score is not None else params.min_score
+    )
     detector = LaneATTDetector(LaneATTConfig.from_config(params.laneatt))
 
     video_path = Path(args.source)
@@ -155,32 +183,50 @@ def main() -> None:
 
     for frame_idx, frame in frames:
         result = detector.detect(frame)
-        lanes = [
-            lane
-            for lane in getattr(result, "lanes", [])
-            if getattr(lane, "score", 1.0) >= params.min_score
-        ]
-        if not lanes:
+        all_lanes = list(getattr(result, "lanes", []))
+        if not all_lanes:
+            print(f"[LaneATT] Frame {frame_idx}: no lanes detected at all.")
             continue
-        scaled_lanes = _rescale_lane_points(lanes, frame.shape[:2])
-        if not scaled_lanes:
+
+        scaled_all = _rescale_lane_points(all_lanes, frame.shape[:2])
+        if not scaled_all:
+            print(f"[LaneATT] Frame {frame_idx}: no lanes after rescaling.")
             continue
-        scaled_lanes.sort(key=lambda lane: lane.bottom_point[0])
-        scores = [lane.score for lane in scaled_lanes]
+
+        scaled_all.sort(key=lambda lane: lane.bottom_point[0])
+        scores = [float(getattr(lane, "score", 1.0)) for lane in scaled_all]
         if scores:
+            count_roi = sum(s >= params.min_score for s in scores)
+            count_vis = sum(s >= vis_min_score for s in scores)
             print(
                 (
-                    f"[LaneATT] Frame {frame_idx}: {len(scores)} lanes | score min="
-                    f"{min(scores):.3f}, max={max(scores):.3f}, avg={statistics.mean(scores):.3f}"
+                    f"[LaneATT] Frame {frame_idx}: {len(scores)} lanes total | "
+                    f"score min={min(scores):.3f}, max={max(scores):.3f}, "
+                    f"avg={statistics.mean(scores):.3f} | "
+                    f">=min_score({params.min_score:.3f})={count_roi}, "
+                    f">=vis_min_score({vis_min_score:.3f})={count_vis}"
                 )
             )
+
+        viz_lanes = [lane for lane in scaled_all if getattr(lane, "score", 1.0) >= vis_min_score]
+        roi_lanes = [lane for lane in scaled_all if getattr(lane, "score", 1.0) >= params.min_score]
+
         overlay_source = frame
 
-        vis = _draw_lanes(frame, scaled_lanes)
-        reference_idx = len(scaled_lanes) - 2 if len(scaled_lanes) >= 2 else len(scaled_lanes) - 1
-        reference_lane = scaled_lanes[reference_idx]
-        right_lane = scaled_lanes[-1]
-        if reference_idx != len(scaled_lanes) - 1:
+        vis = _draw_lanes(frame, viz_lanes, trusted_min_score=params.min_score)
+        cv2.imwrite(str(debug_dir / f"lanes_{frame_idx:05d}.jpg"), vis)
+
+        if not roi_lanes:
+            print(
+                f"[LaneATT] Frame {frame_idx}: no lanes above min_score="
+                f"{params.min_score:.3f}; skipping ROI sampling."
+            )
+            continue
+
+        reference_idx = len(roi_lanes) - 2 if len(roi_lanes) >= 2 else len(roi_lanes) - 1
+        reference_lane = roi_lanes[reference_idx]
+        right_lane = roi_lanes[-1]
+        if reference_idx != len(roi_lanes) - 1:
             cv2.line(vis, reference_lane.points[0], reference_lane.points[1], (0, 165, 255), 3)
             cv2.putText(
                 vis,
@@ -195,12 +241,15 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-        if len(scaled_lanes) >= 2:
+
+        if len(roi_lanes) >= 2:
             width_sample = right_lane.bottom_point[0] - reference_lane.bottom_point[0]
             if width_sample > 0 and _should_accept_width_sample(
                 width_sample, frame.shape[1], params, f"Frame {frame_idx}"
             ):
                 lane_width_samples.append(width_sample)
+                print(f"[LaneATT] Frame {frame_idx}: width sample={width_sample:.2f}px")
+
         cv2.imwrite(str(debug_dir / f"lanes_{frame_idx:05d}.jpg"), vis)
         reference_lanes.append(reference_lane)
 
