@@ -35,6 +35,7 @@ class LaneATTParams:
     min_lane_frames: int = 4
     emergency_width_factor: float = 1.0
     min_roi_width_px: int = 80
+    fallback_lane_width_ratio: float = 0.10
     allow_auto_cv_fallback: bool = True
     save_debug: bool = True
     laneatt: Dict[str, object] = field(default_factory=dict)
@@ -53,9 +54,22 @@ class LaneATTParams:
             min_score=float(max(0.0, data.get("min_score", cls.min_score))),
             min_lane_frames=int(max(1, data.get("min_lane_frames", cls.min_lane_frames))),
             emergency_width_factor=float(
-                max(0.3, data.get("emergency_width_factor", cls.emergency_width_factor))
+                max(0.3, float(data.get("emergency_width_factor", cls.emergency_width_factor)))
             ),
-            min_roi_width_px=int(max(20, data.get("min_roi_width_px", cls.min_roi_width_px))),
+            min_roi_width_px=int(max(20, int(data.get("min_roi_width_px", cls.min_roi_width_px)))),
+            fallback_lane_width_ratio=float(
+                max(
+                    0.02,
+                    min(
+                        0.5,
+                        float(
+                            data.get(
+                                "fallback_lane_width_ratio", cls.fallback_lane_width_ratio
+                            )
+                        ),
+                    ),
+                )
+            ),
             allow_auto_cv_fallback=bool(
                 data.get("allow_auto_cv_fallback", cls.allow_auto_cv_fallback)
             ),
@@ -143,9 +157,11 @@ def _build_polygon(
     bottom_x = clamp_x(line.points[1][0] + params.buffer)
     if lane_width_px is not None and lane_width_px > 0:
         lane_w = max(params.min_roi_width_px, lane_width_px * params.emergency_width_factor)
-        right_x = clamp_x(bottom_x + lane_w)
     else:
-        right_x = width - 1
+        default_lane_w = width * params.fallback_lane_width_ratio
+        lane_w = max(params.min_roi_width_px, default_lane_w)
+
+    right_x = clamp_x(bottom_x + lane_w)
     polygon = [
         (bottom_x, bottom_y),
         (right_x, bottom_y),
@@ -194,7 +210,8 @@ def estimate_roi_laneatt(
     detections: List[LaneDetection] = []
     all_lane_bottom_xs: List[List[float]] = []
     overlay_image: Optional[np.ndarray] = None
-    lane_width_px: Optional[float] = None
+    lane_width_raw_px: Optional[float] = None
+    lane_width_final_px: Optional[float] = None
     for index, frame in sampled:
         result = detector.detect(frame)
         lanes = [
@@ -231,12 +248,21 @@ def estimate_roi_laneatt(
                 xs = sorted(xs)
                 if len(xs) >= 2:
                     lane_widths.extend(xs[i] - xs[i - 1] for i in range(1, len(xs)))
-            lane_width_px = statistics.median(lane_widths) if lane_widths else None
+            lane_width_raw_px = statistics.median(lane_widths) if lane_widths else None
+            _frame_height, frame_width = overlay_image.shape[:2]  # type: ignore[misc]
+            if lane_width_raw_px is not None and lane_width_raw_px > 0:
+                lane_width_final_px = max(
+                    params.min_roi_width_px,
+                    lane_width_raw_px * params.emergency_width_factor,
+                )
+            else:
+                default_lane_w = frame_width * params.fallback_lane_width_ratio
+                lane_width_final_px = max(params.min_roi_width_px, default_lane_w)
             polygon = _build_polygon(
                 detected_line,
                 overlay_image.shape[:2],  # type: ignore[arg-type]
                 params,
-                lane_width_px=lane_width_px,
+                lane_width_px=lane_width_raw_px,
             )
             success = True
             message = ""
@@ -247,8 +273,10 @@ def estimate_roi_laneatt(
         "engine": "laneatt",
         "laneatt_model_loaded": 1.0 if detector.model_loaded else 0.0,
     }
-    if lane_width_px is not None:
-        metrics["lane_width_px"] = float(lane_width_px)
+    if detected_line is not None:
+        metrics["lane_width_raw_px"] = float(lane_width_raw_px or 0.0)
+        if lane_width_final_px is not None:
+            metrics["lane_width_px"] = float(lane_width_final_px)
     if overlay and overlay_image is not None and polygon:
         overlay_img = _render_overlay(overlay_image, polygon, detected_line)
         target_dir = overlay_dir or (OUTPUTS_DIR / "laneatt")
