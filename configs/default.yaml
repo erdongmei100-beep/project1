@@ -46,6 +46,8 @@ roi:
     buffer: 12                  # ROI 相对车道线向右偏移的像素
     min_score: 0.05             # 接受的 LaneATT 最小置信度
     min_lane_frames: 4          # 至少检测到多少帧车道线才认为成功
+    emergency_width_factor: 1.0   # ROI 宽度系数：≈(该值 × 估计车道宽)
+    min_roi_width_px: 80           # ROI 最小像素宽，避免过窄时看不见
     allow_auto_cv_fallback: false  # 失败时是否回退到 auto_cv 逻辑
     save_debug: true            # 是否保存 LaneATT 调试叠加图
     laneatt:
