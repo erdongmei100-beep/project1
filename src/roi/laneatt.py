@@ -36,6 +36,8 @@ class LaneATTParams:
     emergency_width_factor: float = 1.0
     min_roi_width_px: int = 80
     fallback_lane_width_ratio: float = 0.10
+    min_width_sample_px: int = 40
+    max_width_sample_ratio: float = 0.7
     allow_auto_cv_fallback: bool = True
     save_debug: bool = True
     laneatt: Dict[str, object] = field(default_factory=dict)
@@ -65,6 +67,22 @@ class LaneATTParams:
                         float(
                             data.get(
                                 "fallback_lane_width_ratio", cls.fallback_lane_width_ratio
+                            )
+                        ),
+                    ),
+                )
+            ),
+            min_width_sample_px=int(
+                max(10, int(data.get("min_width_sample_px", cls.min_width_sample_px)))
+            ),
+            max_width_sample_ratio=float(
+                max(
+                    0.1,
+                    min(
+                        0.95,
+                        float(
+                            data.get(
+                                "max_width_sample_ratio", cls.max_width_sample_ratio
                             )
                         ),
                     ),
@@ -151,6 +169,30 @@ def _rescale_lane_points(
     return scaled
 
 
+def _should_accept_width_sample(
+    width_sample: float, frame_width: int, params: LaneATTParams, context: str
+) -> bool:
+    """Check if a lane-width sample falls inside the configured range."""
+
+    min_sample = float(params.min_width_sample_px)
+    max_sample = float(frame_width * params.max_width_sample_ratio)
+    if min_sample <= width_sample <= max_sample:
+        print(
+            (
+                f"[LaneATT] {context}: width sample accepted = {width_sample:.2f}px "
+                f"(range {min_sample:.1f}~{max_sample:.1f})."
+            )
+        )
+        return True
+    print(
+        (
+            f"[LaneATT] {context}: ignore suspicious width sample="
+            f"{width_sample:.2f}px (min={min_sample:.1f}, max={max_sample:.1f})."
+        )
+    )
+    return False
+
+
 def _aggregate_lane(lanes: Iterable[LaneDetection]) -> Optional[DetectedLine]:
     lanes = list(lanes)
     if not lanes:
@@ -210,6 +252,11 @@ def _build_polygon(
         lane_w = max(params.min_roi_width_px, default_lane_w)
 
     right_x = clamp_x(bottom_x + lane_w)
+    roi_width = right_x - bottom_x
+    desired_width = int(min(max(lane_w, params.min_roi_width_px), width))
+    if roi_width < params.min_roi_width_px and desired_width > roi_width:
+        bottom_x = clamp_x(right_x - desired_width)
+        roi_width = right_x - bottom_x
     polygon = [
         (bottom_x, bottom_y),
         (right_x, bottom_y),
@@ -217,7 +264,6 @@ def _build_polygon(
         (top_x, top_y),
     ]
     width_float = float(max(1, width))
-    roi_width = right_x - bottom_x
     print(
         (
             f"[LaneATT] ROI bounds -> left: {bottom_x}px ({bottom_x / width_float:.3f}), "
@@ -234,7 +280,9 @@ def _resolve_lane_width(
     """Return the final lane width while guarding against implausible values."""
 
     raw_for_calc = lane_width_raw_px
-    if raw_for_calc is not None and not (30.0 <= raw_for_calc <= 1000.0):
+    min_valid = float(params.min_width_sample_px)
+    max_valid = float(frame_width * params.max_width_sample_ratio)
+    if raw_for_calc is not None and not (min_valid <= raw_for_calc <= max_valid):
         print(
             (
                 f"[LaneATT] WARNING: lane_width_raw_px={raw_for_calc:.2f} outside "
@@ -311,11 +359,11 @@ def estimate_roi_laneatt(
         print(f"[LaneATT] Frame {index}: lane bottom_x values -> {bottom_str}")
         if len(bottom_xs) >= 2:
             width_sample = bottom_xs[-1] - bottom_xs[-2]
-            if width_sample > 0:
+            frame_width = frame.shape[1]
+            if width_sample > 0 and _should_accept_width_sample(
+                width_sample, frame_width, params, f"Frame {index}"
+            ):
                 lane_width_samples.append(width_sample)
-                print(
-                    f"[LaneATT] Frame {index}: right-lane width sample = {width_sample:.2f}px"
-                )
         reference_idx = len(scaled_lanes) - 2 if len(scaled_lanes) >= 2 else len(scaled_lanes) - 1
         reference_lane = scaled_lanes[reference_idx]
         print(
@@ -341,9 +389,22 @@ def estimate_roi_laneatt(
             polygon = None
             message = "laneatt_failed_geometry"
         else:
-            lane_width_raw_px = (
-                statistics.median(lane_width_samples) if lane_width_samples else None
-            )
+            if lane_width_samples:
+                lane_width_raw_px = statistics.median(lane_width_samples)
+                print(
+                    (
+                        "[LaneATT] lane width samples -> "
+                        f"count={len(lane_width_samples)}, "
+                        f"min={min(lane_width_samples):.2f}, "
+                        f"max={max(lane_width_samples):.2f}, "
+                        f"median={lane_width_raw_px:.2f}"
+                    )
+                )
+            else:
+                lane_width_raw_px = None
+                print(
+                    "[LaneATT] No valid lane-width samples; will fall back to default width."
+                )
             _frame_height, frame_width = overlay_image.shape[:2]  # type: ignore[misc]
             lane_width_final_px = _resolve_lane_width(
                 lane_width_raw_px, frame_width, params

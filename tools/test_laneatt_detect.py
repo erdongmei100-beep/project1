@@ -32,6 +32,7 @@ from src.roi.laneatt import (
     _rescale_lane_points,
     _resolve_lane_width,
     _sample_frames,
+    _should_accept_width_sample,
 )
 from src.utils.paths import OUTPUTS_DIR
 
@@ -196,11 +197,10 @@ def main() -> None:
             )
         if len(scaled_lanes) >= 2:
             width_sample = right_lane.bottom_point[0] - reference_lane.bottom_point[0]
-            if width_sample > 0:
+            if width_sample > 0 and _should_accept_width_sample(
+                width_sample, frame.shape[1], params, f"Frame {frame_idx}"
+            ):
                 lane_width_samples.append(width_sample)
-                print(
-                    f"[LaneATT] Frame {frame_idx}: width sample={width_sample:.2f}px"
-                )
         cv2.imwrite(str(debug_dir / f"lanes_{frame_idx:05d}.jpg"), vis)
         reference_lanes.append(reference_lane)
 
@@ -209,9 +209,20 @@ def main() -> None:
         return
 
     aggregated = _aggregate_lane(reference_lanes)
-    lane_width_raw_px = (
-        float(statistics.median(lane_width_samples)) if lane_width_samples else None
-    )
+    if lane_width_samples:
+        lane_width_raw_px = float(statistics.median(lane_width_samples))
+        print(
+            (
+                "[LaneATT] lane width samples -> "
+                f"count={len(lane_width_samples)}, "
+                f"min={min(lane_width_samples):.2f}, "
+                f"max={max(lane_width_samples):.2f}, "
+                f"median={lane_width_raw_px:.2f}"
+            )
+        )
+    else:
+        lane_width_raw_px = None
+        print("[LaneATT] No valid lane-width samples; will fall back to default width.")
     lane_width_px = None
     if overlay_source is not None:
         frame_width = overlay_source.shape[1]
