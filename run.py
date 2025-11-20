@@ -426,10 +426,10 @@ def main() -> None:
     if not roi_path.exists():
         # >>> 自动 ROI 生成
         auto_mode = str(roi_cfg.get("mode", "")).lower()
-        if auto_mode == "auto_line":
-            auto_script = PROJECT_ROOT / "tools" / "roi_auto_line.py"
+        if auto_mode == "yolo_gen":
+            auto_script = PROJECT_ROOT / "tools" / "roi_yolo_gen.py"
             if auto_script.exists():
-                auto_cfg = dict(roi_cfg.get("auto_line", {}) or {})
+                auto_cfg = dict(roi_cfg.get("yolo_gen", {}) or {})
                 cmd = [
                     sys.executable,
                     str(auto_script),
@@ -439,27 +439,22 @@ def main() -> None:
                     str(roi_path),
                 ]
                 flag_map = {
-                    "sample_frames": "--sample-frames",
-                    "crop_right": "--crop-right",
-                    "crop_bottom": "--crop-bottom",
-                    "s_max": "--s-max",
-                    "v_min": "--v-min",
-                    "angle_min": "--angle-min",
-                    "angle_max": "--angle-max",
-                    "top_ratio": "--top-ratio",
-                    "bottom_margin": "--bottom-margin",
-                    "buffer": "--buffer",
+                    "model": "--model",
+                    "class_id": "--class-id",
+                    "conf": "--conf",
                 }
                 for key, flag in flag_map.items():
                     if key in auto_cfg and auto_cfg[key] is not None:
                         cmd.extend([flag, str(auto_cfg[key])])
+                if bool(auto_cfg.get("show")):
+                    cmd.append("--show")
                 try:
-                    print("未找到 ROI 文件，正在执行自动白线检测生成...")
+                    print("未找到 ROI 文件，正在执行 YOLO 自动生成...")
                     subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
                 except subprocess.CalledProcessError as exc:
-                    print(f"自动白线检测失败（退出码 {exc.returncode}）：{exc}")
+                    print(f"YOLO 自动 ROI 生成失败（退出码 {exc.returncode}）：{exc}")
                 except Exception as exc:
-                    print(f"自动白线检测执行失败：{exc}")
+                    print(f"YOLO 自动 ROI 生成执行失败：{exc}")
         # <<< 自动 ROI 生成
         if not roi_path.exists():
             try:
