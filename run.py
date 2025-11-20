@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,15 +19,11 @@ from src.render.overlay import draw_overlays
 from src.roi.manager import ROIManager
 from src.utils.config import load_config, resolve_path, save_config
 from src.utils.paths import (
-    CONFIGS_DIR,
-    DATA_DIR,
     OUTPUTS_DIR,
     PROJECT_ROOT,
     project_path,
     resolve_project_path,
 )
-from src.plates import VehicleFilter
-from src.utils.weights import ensure_plate_weights
 
 
 DEFAULT_CONFIG_REL = project_path("configs", "default.yaml").relative_to(PROJECT_ROOT)
@@ -64,16 +59,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Export per-event video clips with buffered context.",
     )
-    parser.add_argument(
-        "--plate",
-        action="store_true",
-        help="Export per-event plate crops (best frame snapshot).",
-    )
-    parser.add_argument(
-        "--weights-plate",
-        default=None,
-        help="Optional override for plate detector weights path.",
-    )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         joined = " ".join(unknown)
@@ -86,7 +71,7 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
     tracking_cfg = config.get("tracking", {})
     return DetectorTracker(
         weights=model_cfg.get("weights", "yolov8n.pt"),
-        device=model_cfg.get("device", "cpu"),
+        device=model_cfg.get("device", 0),
         imgsz=int(model_cfg.get("imgsz", 640)),
         tracker_cfg=tracker_cfg_path,
         conf=float(tracking_cfg.get("conf", 0.25)),
@@ -95,13 +80,10 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
     )
 
 
-def export_events(
-    events, output_csv: Path, fps: float, plate_metadata: Optional[List[Dict[str, object]]] = None
-) -> None:
+def export_events(events, output_csv: Path, fps: float) -> None:
     if not events:
         print("No occupancy events detected; skipping CSV export.")
         return
-    include_plate = plate_metadata is not None
     rows = []
     for event in events:
         start_time = event.start_frame / fps if fps else None
@@ -114,33 +96,8 @@ def export_events(
             "start_time_s": start_time,
             "end_time_s": end_time,
         }
-        if include_plate:
-            meta = {}
-            if plate_metadata and len(plate_metadata) > len(rows):
-                meta = plate_metadata[len(rows)]
-            row.update(
-                {
-                    "plate_img": meta.get("plate_img", ""),
-                    "plate_conf": meta.get("plate_conf"),
-                    "plate_score": meta.get("plate_score"),
-                    "plate_text": meta.get("plate_text"),
-                    "tail_img": meta.get("tail_img", ""),
-                    "plate_sharp_post": meta.get("plate_sharp_post"),
-                }
-            )
         rows.append(row)
     df = pd.DataFrame(rows)
-    if include_plate:
-        for column in [
-            "plate_img",
-            "plate_conf",
-            "plate_score",
-            "plate_text",
-            "tail_img",
-            "plate_sharp_post",
-        ]:
-            if column not in df.columns:
-                df[column] = None
     df.to_csv(output_csv, index=False)
     print(f"Saved CSV to {output_csv}")
 
@@ -259,117 +216,6 @@ def _classify_event_motion(event: OccupancyEvent, metadata: VideoMetadata) -> st
     return "unknown"
 
 
-def _select_plate_frame(
-    event: OccupancyEvent,
-    metadata: VideoMetadata,
-    fps: float,
-    pre_seconds: float,
-    post_seconds: float,
-) -> Optional[Tuple[int, FrameOccupancy]]:
-    if not event.frames:
-        return None
-
-    effective_fps = fps if fps > 0 else (metadata.fps if metadata.fps > 0 else 25.0)
-    pre_frames = int(max(pre_seconds, 0.0) * effective_fps)
-    post_frames = int(max(post_seconds, 0.0) * effective_fps)
-
-    motion_type = _classify_event_motion(event, metadata)
-
-    if motion_type == "front_static":
-        reference = event.frames[0]
-        frame_idx = max(reference.frame_idx - pre_frames, 0)
-        return frame_idx, reference
-
-    candidates: List[FrameOccupancy] = [
-        frame for frame in event.frames if frame.frame_idx >= event.start_frame + post_frames
-    ]
-    if not candidates:
-        candidates = event.frames[:]
-
-    best_frame: Optional[FrameOccupancy] = None
-    best_score: Optional[Tuple[float, float]] = None
-    for frame_record in candidates:
-        confidence = frame_record.confidence if frame_record.confidence is not None else float("-inf")
-        proximity = -abs(event.end_frame - frame_record.frame_idx)
-        score = (confidence, proximity)
-        if best_score is None or score > best_score:
-            best_score = score
-            best_frame = frame_record
-
-    if best_frame is None:
-        best_frame = event.frames[-1]
-    return best_frame.frame_idx, best_frame
-
-
-def _read_frame(video_path: Path, frame_idx: int) -> Optional[np.ndarray]:
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        return None
-    capture.set(cv2.CAP_PROP_POS_FRAMES, max(frame_idx, 0))
-    success, frame = capture.read()
-    capture.release()
-    if not success:
-        return None
-    return frame
-
-
-def _crop_with_padding(frame: np.ndarray, bbox: Tuple[float, float, float, float], padding: float) -> Optional[np.ndarray]:
-    height, width = frame.shape[:2]
-    x1, y1, x2, y2 = bbox
-    pad_ratio = max(padding, 0.0)
-    pad_x = (x2 - x1) * pad_ratio
-    pad_y = (y2 - y1) * pad_ratio
-
-    x_min = max(int(math.floor(x1 - pad_x)), 0)
-    y_min = max(int(math.floor(y1 - pad_y)), 0)
-    x_max = min(int(math.ceil(x2 + pad_x)), width)
-    y_max = min(int(math.ceil(y2 + pad_y)), height)
-
-    if x_max <= x_min or y_max <= y_min:
-        return None
-    return frame[y_min:y_max, x_min:x_max].copy()
-
-
-def export_plate_crops(
-    events: List[OccupancyEvent],
-    metadata: VideoMetadata,
-    output_dir: Path,
-    fps: float,
-    padding: float,
-    plate_subdir: str,
-    pre_seconds: float,
-    post_seconds: float,
-) -> None:
-    if not events:
-        print("No occupancy events detected; skipping plate export.")
-        return
-
-    plate_dir = output_dir / plate_subdir
-    plate_dir.mkdir(parents=True, exist_ok=True)
-
-    for index, event in enumerate(events, start=1):
-        selection = _select_plate_frame(event, metadata, fps, pre_seconds, post_seconds)
-        if selection is None:
-            continue
-        frame_idx, frame_info = selection
-        frame = _read_frame(metadata.path, frame_idx)
-        if frame is None:
-            print(f"Failed to read frame {frame_idx} for plate capture (track {event.track_id}).")
-            continue
-
-        crop = _crop_with_padding(frame, frame_info.bbox, padding)
-        if crop is None:
-            print(f"Unable to crop plate for track {event.track_id}; bounding box out of range.")
-            continue
-
-        plate_name = f"{metadata.path.stem}_event{index:02d}_track{event.track_id}_{frame_idx:06d}.jpg"
-        plate_path = plate_dir / plate_name
-        if cv2.imwrite(str(plate_path), crop):
-            print(f"Saved plate crop to {plate_path}")
-        else:
-            print(f"Failed to save plate crop for track {event.track_id}.")
-
-
 def _get_float_config(value: object, default: float) -> float:
     try:
         return float(value)
@@ -390,7 +236,6 @@ def main() -> None:
     tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
 
     data_cfg = dict(config.get("data", {}) or {})
-    weights_cfg = dict(config.get("weights", {}) or {})
 
     metadata = probe_video(source_path)
     print(
@@ -516,78 +361,9 @@ def main() -> None:
     clip_post_seconds = _get_float_config(outputs_cfg.get("clip_post_seconds"), 1.0)
     clip_subdir = str(outputs_cfg.get("clip_dir") or "clips")
 
-    plate_cfg = dict(config.get("plate", {}) or {})
-    plate_enabled = bool(args.plate or plate_cfg.get("enable", False))
-    plate_metadata: List[Dict[str, object]] = []
-    collector = None
-    plate_every_n_frames = 1
-    vehicle_filter = VehicleFilter(
-        plate_cfg.get("classes_allow"),
-        float(plate_cfg.get("bbox_aspect_min", 0.9)),
-        int(plate_cfg.get("min_box_h_px", 60)),
-    )
-    track_label_votes: Dict[int, Dict[str, Tuple[int, float]]] = {}
-
-    if plate_enabled:
-        from src.plates.detector_yolo import PlateDetector
-        from src.plates.collector import PlateCollector
-
-        plate_dirname = str(outputs_cfg.get("plate_dir") or "plates")
-        plates_out_dir = output_dir / plate_dirname
-        plates_out_dir.mkdir(parents=True, exist_ok=True)
-
-        configured_weight = plate_cfg.get("det_weights") or weights_cfg.get("plate")
-        env_plate_value = os.getenv("PLATE_WEIGHTS") or None
-        configured_value = str(configured_weight) if configured_weight else None
-        plate_weights_path = ensure_plate_weights(
-            args.weights_plate,
-            env_plate_value,
-            configured_value,
-        )
-
-        plate_cfg_resolved = dict(plate_cfg)
-
-        plate_cfg_resolved["det_weights"] = str(plate_weights_path)
-        try:
-            detector = PlateDetector(
-                weights=plate_cfg_resolved["det_weights"],
-                device=str(plate_cfg_resolved.get("device", "cpu")),
-                imgsz=int(plate_cfg_resolved.get("imgsz", 320)),
-                conf=float(plate_cfg_resolved.get("conf", 0.25)),
-                iou=float(plate_cfg_resolved.get("iou", 0.45)),
-            )
-            collector = PlateCollector(plate_cfg_resolved, plates_out_dir, detector=detector)
-            plate_every_n_frames = max(getattr(collector, "every_n_frames", 1), 1)
-            if getattr(collector, "detector_available", False):
-                print(
-                    f"Plate detection enabled (weights: {plate_cfg_resolved['det_weights']}, device: {detector.device})."
-                )
-            else:
-                print(
-                    "Plate detector inactive; continuing with tail snapshot fallback only."
-                )
-        except Exception as exc:
-            print(f"Failed to initialize plate detection; continuing without it: {exc}")
-            collector = None
-            plate_enabled = False
-
-    if not plate_enabled:
-        print("Plate detection disabled.")
-
     tracker = prepare_tracker(config, tracker_cfg)
     video_writer = None
     fps = metadata.fps or 25.0
-    event_counter = 0
-
-    def _default_plate_meta() -> Dict[str, object]:
-        return {
-            "plate_img": "",
-            "plate_conf": None,
-            "plate_score": None,
-            "plate_text": "null",
-            "tail_img": "",
-            "plate_sharp_post": None,
-        }
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -607,8 +383,6 @@ def main() -> None:
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []
-            present_vote_ids: set[int] = set()
-            frame_height = frame.shape[0]
             if boxes is not None and boxes.id is not None:
                 ids = boxes.id
                 if hasattr(ids, "cpu"):
@@ -627,55 +401,18 @@ def main() -> None:
                     np.array(confs).flatten().tolist() if confs is not None else [None] * len(coords_list)
                 )
 
-                cls_ids = getattr(boxes, "cls", None)
-                if cls_ids is not None and hasattr(cls_ids, "cpu"):
-                    cls_ids = cls_ids.cpu().numpy()
-                cls_list = (
-                    np.array(cls_ids).flatten().tolist() if cls_ids is not None else [None] * len(coords_list)
-                )
-
-                names_map = getattr(result, "names", None)
-
                 total = min(len(ids_list), len(coords_list))
                 for idx in range(total):
                     track_id = ids_list[idx]
                     if track_id is None or (isinstance(track_id, float) and math.isnan(track_id)):
                         continue
                     track_id_int = int(track_id)
-                    present_vote_ids.add(track_id_int)
 
-                    bbox = coords_list[idx]
-                    conf = conf_list[idx] if idx < len(conf_list) else None
-                    cls_id = cls_list[idx] if idx < len(cls_list) else None
-
-                    class_name = ""
-                    cls_index: Optional[int] = None
-                    if cls_id is not None and not (isinstance(cls_id, float) and math.isnan(cls_id)):
-                        try:
-                            cls_index = int(cls_id)
-                        except (TypeError, ValueError):
-                            cls_index = None
-                    if cls_index is not None:
-                        if isinstance(names_map, dict):
-                            class_name = str(names_map.get(cls_index, ""))
-                        elif isinstance(names_map, (list, tuple)):
-                            if 0 <= cls_index < len(names_map):
-                                class_name = str(names_map[cls_index])
-                        if not class_name:
-                            class_name = str(cls_index)
-                    class_name = class_name.lower() if class_name else ""
-
-                    votes = track_label_votes.setdefault(track_id_int, {})
-                    if class_name:
-                        prev_count, prev_conf = votes.get(class_name, (0, 0.0))
-                        conf_val = float(conf) if conf is not None else 0.0
-                        votes[class_name] = (prev_count + 1, max(prev_conf, conf_val))
-
-                    x1, y1, x2, y2 = bbox
-                    width = max(float(x2) - float(x1), 0.0)
-                    height = max(float(y2) - float(y1), 0.0)
-                    if not vehicle_filter.is_vehicle(votes, (width, height), frame_height):
+                    bbox = coords_list[idx] if idx < len(coords_list) else None
+                    if bbox is None or len(bbox) < 4:
                         continue
+                    conf = conf_list[idx] if idx < len(conf_list) else None
+                    x1, y1, x2, y2 = bbox[:4]
 
                     footpoint = ((x1 + x2) / 2.0, y2)
                     inside = roi_manager.point_in_roi(footpoint)
@@ -689,55 +426,12 @@ def main() -> None:
                         }
                     )
 
-            missing_vote_ids = set(track_label_votes.keys()) - present_vote_ids
-            for missing_id in list(missing_vote_ids):
-                track_label_votes.pop(missing_id, None)
-
-            if plate_enabled and collector is not None and frame_idx % plate_every_n_frames == 0:
-                for entry in track_entries:
-                    if not entry.get("inside"):
-                        continue
-                    bbox_entry = entry["bbox"]
-                    car_xyxy_full = [
-                        int(math.floor(bbox_entry[0])),
-                        int(math.floor(bbox_entry[1])),
-                        int(math.ceil(bbox_entry[2])),
-                        int(math.ceil(bbox_entry[3])),
-                    ]
-                    try:
-                        collector.update(
-                            track_id=int(entry["track_id"]),
-                            frame_idx=frame_idx,
-                            car_xyxy_full=car_xyxy_full,
-                            frame_bgr=frame,
-                        )
-                    except Exception as exc:
-                        print(f"Plate collector update failed for track {entry['track_id']}: {exc}")
-
             new_events = accumulator.update(frame_idx, track_entries)
             for event in new_events:
                 duration = event.duration_frames
                 print(
                     f"Completed event: track {event.track_id} | frames {event.start_frame}-{event.end_frame} | duration {duration}"
                 )
-                event_counter += 1
-                if plate_enabled:
-                    meta = _default_plate_meta()
-                    if collector is not None:
-                        try:
-                            meta = collector.finalize_and_save(
-                                event_counter, event.track_id, start_frame=event.start_frame
-                            )
-                        except Exception as exc:
-                            print(f"Plate finalize failed for track {event.track_id}: {exc}")
-                        finally:
-                            try:
-                                collector.clear(event_counter, event.track_id)
-                            except Exception as clear_exc:
-                                print(
-                                    f"Failed to clear plate collector for track {event.track_id}: {clear_exc}"
-                                )
-                    plate_metadata.append(meta)
 
             annotated = frame.copy()
             draw_overlays(annotated, roi_manager.polygon, track_entries, show_tracks, show_footpoints)
@@ -748,31 +442,11 @@ def main() -> None:
         if video_writer is not None:
             video_writer.release()
 
-    remaining_events = accumulator.flush()
-    for event in remaining_events:
-        event_counter += 1
-        if plate_enabled:
-            meta = _default_plate_meta()
-            if collector is not None:
-                try:
-                    meta = collector.finalize_and_save(
-                        event_counter, event.track_id, start_frame=event.start_frame
-                    )
-                except Exception as exc:
-                    print(f"Plate finalize failed for track {event.track_id}: {exc}")
-                finally:
-                    try:
-                        collector.clear(event_counter, event.track_id)
-                    except Exception as clear_exc:
-                        print(
-                            f"Failed to clear plate collector for track {event.track_id}: {clear_exc}"
-                        )
-            plate_metadata.append(meta)
-
+    accumulator.flush()
     events = list(accumulator.completed)
     if args.save_csv:
         csv_path = output_dir / outputs_cfg.get("csv_filename", "occupancy.csv")
-        export_events(events, csv_path, fps, plate_metadata if plate_enabled else None)
+        export_events(events, csv_path, fps)
 
     if args.clip:
         export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
@@ -780,4 +454,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

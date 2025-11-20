@@ -1,6 +1,7 @@
+# Install CUDA-enabled PyTorch manually, e.g.:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 numpy
 pandas
 opencv-python
-torch
 ultralytics
 streamlit
