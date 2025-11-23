@@ -17,7 +17,7 @@ from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.render.overlay import draw_overlays
 from src.roi.manager import ROIManager
-from src.utils.config import load_config, resolve_path, save_config
+from src.utils.config import load_config, resolve_path
 from src.utils.paths import (
     OUTPUTS_DIR,
     PROJECT_ROOT,
@@ -28,12 +28,11 @@ from src.utils.paths import (
 
 DEFAULT_CONFIG_REL = project_path("configs", "default.yaml").relative_to(PROJECT_ROOT)
 DEFAULT_TRACKER_CFG_REL = project_path("configs", "tracker", "bytetrack.yaml").relative_to(PROJECT_ROOT)
-DEFAULT_ROIS_DIR = project_path("data", "rois")
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Emergency lane occupancy detection MVP")
-    parser.add_argument("--source", required=True, help="Path to input video")
+    parser.add_argument("--source", required=True, help="Path to input video or directory of videos")
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_REL),
@@ -223,84 +222,59 @@ def _get_float_config(value: object, default: float) -> float:
         return float(default)
 
 
-def main() -> None:
-    args = parse_args()
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = (PROJECT_ROOT / config_path).resolve()
-    config = load_config(config_path)
-
-    source_path = resolve_path(PROJECT_ROOT, args.source)
-    tracking_cfg = dict(config.get("tracking", {}) or {})
-    tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
-    tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
-
-    data_cfg = dict(config.get("data", {}) or {})
-
+def process_video(
+    source_path: Path,
+    config: Dict[str, object],
+    args: argparse.Namespace,
+    tracker_cfg: Path,
+) -> None:
     metadata = probe_video(source_path)
     print(
         f"Video: {metadata.path.name} | FPS: {metadata.fps:.2f} | Frames: {metadata.frame_count} | Size: {metadata.frame_size}"
     )
 
     roi_cfg = dict(config.get("roi", {}) or {})
-    roi_candidates: List[Path] = []
-    roi_path: Optional[Path] = None
+    roi_mode = str(roi_cfg.get("mode", "")).lower()
+    rois_dir = PROJECT_ROOT / "data" / "rois"
+    rois_dir.mkdir(parents=True, exist_ok=True)
 
-    rois_dir = resolve_project_path(data_cfg.get("rois_dir"), DEFAULT_ROIS_DIR)
-    fallback_roi_path = rois_dir / f"{source_path.stem}.json"
-    roi_candidates.append(fallback_roi_path)
+    roi_path: Path = (
+        resolve_path(PROJECT_ROOT, str(args.roi)) if args.roi else (rois_dir / f"{source_path.stem}.json")
+    )
 
-    if args.roi:
-        roi_override = resolve_path(PROJECT_ROOT, str(args.roi))
-        roi_candidates.append(roi_override)
-        roi_path = roi_override
-    else:
-        roi_path_value = roi_cfg.get("path")
-        if isinstance(roi_path_value, (str, Path)) and str(roi_path_value).strip():
-            config_roi_path = resolve_path(PROJECT_ROOT, str(roi_path_value))
-            roi_candidates.append(config_roi_path)
-            roi_path = config_roi_path
-
-    if roi_path is None:
-        roi_path = fallback_roi_path
-
-    if roi_path is None:
-        attempted = ", ".join(str(path) for path in roi_candidates)
-        raise FileNotFoundError(f"ROI path could not be resolved. Checked: {attempted}")
+    if roi_mode == "yolo_gen" and roi_path.exists():
+        try:
+            print(f"Removing existing ROI to force regeneration: {roi_path}")
+            roi_path.unlink()
+        except Exception as exc:
+            print(f"Warning: failed to remove existing ROI {roi_path}: {exc}")
 
     if not roi_path.exists():
-        # >>> 自动 ROI 生成
-        auto_mode = str(roi_cfg.get("mode", "")).lower()
-        if auto_mode == "yolo_gen":
-            auto_script = PROJECT_ROOT / "tools" / "roi_yolo_gen.py"
-            if auto_script.exists():
-                auto_cfg = dict(roi_cfg.get("yolo_gen", {}) or {})
-                cmd = [
-                    sys.executable,
-                    str(auto_script),
-                    "--source",
-                    str(source_path),
-                    "--out",
-                    str(roi_path),
-                ]
-                flag_map = {
-                    "model": "--model",
-                    "class_id": "--class-id",
-                    "conf": "--conf",
-                }
-                for key, flag in flag_map.items():
-                    if key in auto_cfg and auto_cfg[key] is not None:
-                        cmd.extend([flag, str(auto_cfg[key])])
-                if bool(auto_cfg.get("show")):
-                    cmd.append("--show")
-                try:
-                    print("未找到 ROI 文件，正在执行 YOLO 自动生成...")
-                    subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
-                except subprocess.CalledProcessError as exc:
-                    print(f"YOLO 自动 ROI 生成失败（退出码 {exc.returncode}）：{exc}")
-                except Exception as exc:
-                    print(f"YOLO 自动 ROI 生成执行失败：{exc}")
-        # <<< 自动 ROI 生成
+        auto_script = PROJECT_ROOT / "tools" / "roi_yolo_gen.py"
+        if roi_mode == "yolo_gen" and auto_script.exists():
+            auto_cfg = dict(roi_cfg.get("yolo_gen", {}) or {})
+            cmd = [
+                sys.executable,
+                str(auto_script),
+                "--source",
+                str(source_path),
+                "--out",
+                str(roi_path),
+            ]
+            flag_map = {"model": "--model", "class_id": "--class-id", "conf": "--conf"}
+            for key, flag in flag_map.items():
+                if key in auto_cfg and auto_cfg[key] is not None:
+                    cmd.extend([flag, str(auto_cfg[key])])
+            if bool(auto_cfg.get("show")):
+                cmd.append("--show")
+            try:
+                print("未找到 ROI 文件，正在执行 YOLO 自动生成...")
+                subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
+            except subprocess.CalledProcessError as exc:
+                print(f"YOLO 自动 ROI 生成失败（退出码 {exc.returncode}）：{exc}")
+            except Exception as exc:
+                print(f"YOLO 自动 ROI 生成执行失败：{exc}")
+
         if not roi_path.exists():
             try:
                 from tools.roi_make import launch_roi_selector
@@ -310,28 +284,9 @@ def main() -> None:
             except Exception as exc:
                 raise RuntimeError(f"无法创建 ROI：{exc}") from exc
             if not created or not roi_path.exists():
-                attempted = ", ".join(str(path) for path in roi_candidates)
                 raise RuntimeError(
-                    "ROI 标注未完成，无法继续运行。已尝试路径: " f"{attempted}"
+                    "ROI 标注未完成，无法继续运行。已尝试路径: " f"{roi_path}"
                 )
-        try:
-            relative_path = roi_path.relative_to(PROJECT_ROOT)
-            roi_cfg["path"] = str(relative_path)
-        except ValueError:
-            roi_cfg["path"] = str(roi_path)
-        config["roi"] = roi_cfg
-        try:
-            save_config(config_path, config)
-            print(f"已更新配置文件 {config_path} 的 ROI 路径。")
-        except Exception as exc:
-            print(f"警告：无法写入配置文件更新 ROI 路径：{exc}")
-    else:
-        try:
-            relative_path = roi_path.relative_to(PROJECT_ROOT)
-            roi_cfg.setdefault("path", str(relative_path))
-        except ValueError:
-            roi_cfg.setdefault("path", str(roi_path))
-        config["roi"] = roi_cfg
 
     print(f"Using ROI file: {roi_path}")
     roi_manager = ROIManager(roi_path)
@@ -347,15 +302,8 @@ def main() -> None:
     show_footpoints = bool(render_cfg.get("show_footpoints", True))
 
     outputs_cfg = dict(config.get("outputs") or config.get("output") or {})
-    output_dir = resolve_project_path(outputs_cfg.get("root") or outputs_cfg.get("dir"), OUTPUTS_DIR)
+    output_dir = OUTPUTS_DIR / source_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_stem = metadata.path.stem
-    # >>> 默认输出文件名（基于输入视频 stem）
-    if not outputs_cfg.get("video_filename"):
-        outputs_cfg["video_filename"] = f"{source_stem}.mp4"
-    if not outputs_cfg.get("csv_filename"):
-        outputs_cfg["csv_filename"] = f"{source_stem}.csv"
-    # <<< 默认输出文件名
 
     clip_pre_seconds = _get_float_config(outputs_cfg.get("clip_pre_seconds"), 1.0)
     clip_post_seconds = _get_float_config(outputs_cfg.get("clip_post_seconds"), 1.0)
@@ -364,6 +312,8 @@ def main() -> None:
     tracker = prepare_tracker(config, tracker_cfg)
     video_writer = None
     fps = metadata.fps or 25.0
+    video_output_path = output_dir / f"{source_path.stem}.mp4"
+    csv_output_path = output_dir / f"{source_path.stem}.csv"
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -375,7 +325,7 @@ def main() -> None:
                 if args.save_video:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(
-                        str(output_dir / outputs_cfg.get("video_filename", "occupancy.mp4")),
+                        str(video_output_path),
                         fourcc,
                         fps,
                         (frame.shape[1], frame.shape[0]),
@@ -445,11 +395,37 @@ def main() -> None:
     accumulator.flush()
     events = list(accumulator.completed)
     if args.save_csv:
-        csv_path = output_dir / outputs_cfg.get("csv_filename", "occupancy.csv")
-        export_events(events, csv_path, fps)
+        export_events(events, csv_output_path, fps)
 
     if args.clip:
         export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
+
+
+def main() -> None:
+    args = parse_args()
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = (PROJECT_ROOT / config_path).resolve()
+    config = load_config(config_path)
+
+    tracking_cfg = dict(config.get("tracking", {}) or {})
+    tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
+    tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
+
+    source_path = resolve_path(PROJECT_ROOT, args.source)
+    if source_path.is_dir():
+        video_exts = {".mp4", ".avi", ".mov", ".mkv"}
+        video_files: List[Path] = sorted(
+            path for path in source_path.iterdir() if path.suffix.lower() in video_exts
+        )
+        if not video_files:
+            raise FileNotFoundError(f"No video files found in directory {source_path}")
+        for video_path in video_files:
+            process_video(video_path, config, args, tracker_cfg)
+    elif source_path.is_file():
+        process_video(source_path, config, args, tracker_cfg)
+    else:
+        raise FileNotFoundError(f"Source path does not exist: {source_path}")
 
 
 if __name__ == "__main__":
