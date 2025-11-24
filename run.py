@@ -4,26 +4,27 @@ from __future__ import annotations
 import argparse
 import copy
 import math
-import subprocess
-import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
+from ultralytics import YOLO
 
 from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.render.overlay import draw_overlays
-from src.roi.manager import ROIManager
 from src.utils.config import load_config, resolve_path
-from src.utils.paths import PROJECT_ROOT, project_path, resolve_project_path
+from src.utils.paths import PROJECT_ROOT, project_path
 
 
 DEFAULT_CONFIG_REL = project_path("configs", "default.yaml").relative_to(PROJECT_ROOT)
 DEFAULT_TRACKER_CFG_REL = project_path("configs", "tracker", "bytetrack.yaml").relative_to(PROJECT_ROOT)
+DEFAULT_LANE_WEIGHTS_REL = project_path("weights", "lane_seg.pt").relative_to(PROJECT_ROOT)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Emergency lane occupancy detection MVP")
     parser.add_argument("--source", required=True, help="Path to input video or directory of videos")
@@ -43,9 +44,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Save occupancy events as CSV",
     )
     parser.add_argument(
-        "--roi",
-        default=None,
-        help="Optional ROI JSON file that overrides configuration and automatic lookup.",
+        "--lane-weights",
+        default=str(DEFAULT_LANE_WEIGHTS_REL),
+        help="Path to emergency lane segmentation weights.",
     )
     parser.add_argument(
         "--clip",
@@ -71,6 +72,64 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
         iou=float(tracking_cfg.get("iou", 0.45)),
         max_det=int(tracking_cfg.get("max_det", 1000)),
     )
+
+
+def _extract_emergency_lane_mask(result, class_name: str = "emergency_lane") -> Optional[np.ndarray]:
+    if result is None or result.masks is None or result.boxes is None:
+        return None
+
+    target_class_id = None
+    for cls_id, name in (result.names or {}).items():
+        if name == class_name:
+            target_class_id = int(cls_id)
+            break
+    if target_class_id is None:
+        return None
+
+    masks_data = result.masks.data
+    class_ids = result.boxes.cls
+    if masks_data is None or class_ids is None:
+        return None
+
+    if hasattr(masks_data, "cpu"):
+        masks_np = masks_data.cpu().numpy()
+    else:
+        masks_np = np.asarray(masks_data)
+
+    if hasattr(class_ids, "cpu"):
+        class_ids_np = class_ids.cpu().numpy()
+    else:
+        class_ids_np = np.asarray(class_ids)
+
+    combined_mask: Optional[np.ndarray] = None
+    for idx, cls_id in enumerate(class_ids_np):
+        if int(cls_id) != target_class_id:
+            continue
+        if idx >= masks_np.shape[0]:
+            continue
+        current_mask = masks_np[idx] > 0.5
+        combined_mask = current_mask if combined_mask is None else (combined_mask | current_mask)
+
+    return combined_mask
+
+
+def _point_in_mask(point: Tuple[float, float], mask: Optional[np.ndarray]) -> bool:
+    if mask is None:
+        return False
+    h, w = mask.shape[:2]
+    x, y = int(point[0]), int(point[1])
+    if x < 0 or y < 0 or x >= w or y >= h:
+        return False
+    return bool(mask[y, x])
+
+
+def _overlay_lane_mask(frame: np.ndarray, mask: Optional[np.ndarray], color=(255, 255, 0), alpha: float = 0.3) -> np.ndarray:
+    if mask is None:
+        return frame
+    overlay = frame.copy()
+    overlay[mask] = color
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+    return frame
 
 
 def export_events(events, output_csv: Path, fps: float) -> None:
@@ -225,68 +284,21 @@ def _iter_video_files(directory: Path) -> Iterable[Path]:
 
 def process_video(source_path: Path, base_config: Dict[str, object], args: argparse.Namespace) -> None:
     config = copy.deepcopy(base_config)
+    model_cfg = config.get("model", {})
     tracking_cfg = dict(config.get("tracking", {}) or {})
     tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
     tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
+
+    lane_weights_path = resolve_path(PROJECT_ROOT, args.lane_weights)
+    lane_model = YOLO(str(lane_weights_path))
+    lane_predict_args: Dict[str, object] = {"verbose": False}
+    if model_cfg.get("device") is not None:
+        lane_predict_args["device"] = model_cfg.get("device", 0)
 
     metadata = probe_video(source_path)
     print(
         f"Video: {metadata.path.name} | FPS: {metadata.fps:.2f} | Frames: {metadata.frame_count} | Size: {metadata.frame_size}"
     )
-
-    roi_cfg = dict(config.get("roi", {}) or {})
-    roi_path = resolve_project_path(None, project_path("data", "rois")) / f"{source_path.stem}.json"
-    if args.roi:
-        roi_path = resolve_path(PROJECT_ROOT, str(args.roi))
-    roi_path.parent.mkdir(parents=True, exist_ok=True)
-
-    auto_mode = str(roi_cfg.get("mode", "")).lower()
-    if auto_mode == "yolo_gen" and roi_path.exists():
-        roi_path.unlink()
-
-    if not roi_path.exists():
-        if auto_mode == "yolo_gen":
-            auto_script = PROJECT_ROOT / "tools" / "roi_yolo_gen.py"
-            if auto_script.exists():
-                auto_cfg = dict(roi_cfg.get("yolo_gen", {}) or {})
-                cmd = [
-                    sys.executable,
-                    str(auto_script),
-                    "--source",
-                    str(source_path),
-                    "--out",
-                    str(roi_path),
-                ]
-                flag_map = {
-                    "model": "--model",
-                    "class_id": "--class-id",
-                    "conf": "--conf",
-                }
-                for key, flag in flag_map.items():
-                    if key in auto_cfg and auto_cfg[key] is not None:
-                        cmd.extend([flag, str(auto_cfg[key])])
-                if bool(auto_cfg.get("show")):
-                    cmd.append("--show")
-                try:
-                    print("未找到 ROI 文件，正在执行 YOLO 自动生成...")
-                    subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
-                except subprocess.CalledProcessError as exc:
-                    print(f"YOLO 自动 ROI 生成失败（退出码 {exc.returncode}）：{exc}")
-                except Exception as exc:
-                    print(f"YOLO 自动 ROI 生成执行失败：{exc}")
-        if not roi_path.exists():
-            try:
-                from tools.roi_make import launch_roi_selector
-
-                print("未找到 ROI 文件，正在启动交互式标注工具...")
-                created = launch_roi_selector(str(source_path), str(roi_path))
-            except Exception as exc:
-                raise RuntimeError(f"无法创建 ROI：{exc}") from exc
-            if not created or not roi_path.exists():
-                raise RuntimeError("ROI 标注未完成，无法继续运行。")
-
-    print(f"Using ROI file: {roi_path}")
-    roi_manager = ROIManager(roi_path)
 
     events_cfg = config.get("events", {})
     accumulator = EventAccumulator(
@@ -320,7 +332,6 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
             if frame is None:
                 continue
             if frame_idx == 0:
-                roi_manager.ensure_ready((frame.shape[1], frame.shape[0]))
                 if args.save_video:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(
@@ -329,6 +340,19 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                         fps,
                         (frame.shape[1], frame.shape[0]),
                     )
+
+            lane_results = lane_model.predict(source=frame, **lane_predict_args)
+            frame_height, frame_width = frame.shape[:2]
+            lane_result = lane_results[0] if lane_results else None
+            lane_mask = _extract_emergency_lane_mask(lane_result)
+            if lane_mask is not None and lane_mask.shape[:2] != (frame_height, frame_width):
+                resized = cv2.resize(
+                    lane_mask.astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_NEAREST
+                )
+                lane_mask = resized.astype(bool)
+
+            ego_point = (frame_width / 2.0, frame_height - 1)
+            ego_in_lane = _point_in_mask(ego_point, lane_mask)
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []
@@ -364,7 +388,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                     x1, y1, x2, y2 = bbox[:4]
 
                     footpoint = ((x1 + x2) / 2.0, y2)
-                    inside = roi_manager.point_in_roi(footpoint)
+                    inside = False if ego_in_lane else _point_in_mask(footpoint, lane_mask)
                     track_entries.append(
                         {
                             "track_id": track_id_int,
@@ -383,7 +407,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 )
 
             annotated = frame.copy()
-            draw_overlays(annotated, roi_manager.polygon, track_entries, show_tracks, show_footpoints)
+            _overlay_lane_mask(annotated, lane_mask)
+            draw_overlays(annotated, None, track_entries, show_tracks, show_footpoints)
             if args.save_video and video_writer is not None:
                 video_writer.write(annotated)
 
