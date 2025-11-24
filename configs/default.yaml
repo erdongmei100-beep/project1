@@ -15,7 +15,7 @@ roi:
     model: weights/lane_seg.pt
     class_id: 0
     conf: 0.5
-    show: true
+    show: false
 events:
   min_frames_in: 5
   min_frames_out: 5
