@@ -311,6 +311,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     tracker = prepare_tracker(config, tracker_cfg)
     video_writer = None
     fps = metadata.fps or 25.0
+    video_output_path = output_dir / f"{source_path.stem}.mp4"
+    csv_output_path = output_dir / f"{source_path.stem}.csv"
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -322,7 +324,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 if args.save_video:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(
-                        str(output_dir / outputs_cfg.get("video_filename", "occupancy.mp4")),
+                        str(video_output_path),
                         fourcc,
                         fps,
                         (frame.shape[1], frame.shape[0]),
@@ -392,8 +394,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     accumulator.flush()
     events = list(accumulator.completed)
     if args.save_csv:
-        csv_path = output_dir / outputs_cfg.get("csv_filename", "occupancy.csv")
-        export_events(events, csv_path, fps)
+        export_events(events, csv_output_path, fps)
 
     if args.clip:
         export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
