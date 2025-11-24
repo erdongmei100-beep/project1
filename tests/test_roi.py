@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 import unittest
 
+import numpy as np
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
@@ -29,6 +31,16 @@ class ROIManagerTests(unittest.TestCase):
             self.assertFalse(manager.point_in_roi((10, 10)))
         finally:
             tmp_path.unlink(missing_ok=True)
+
+    def test_update_from_segmentation(self):
+        manager = ROIManager()
+        mask = np.zeros((200, 200), dtype=bool)
+        mask[120:180, 120:180] = True
+        status = manager.update_from_segmentation(mask, (200, 200))
+        self.assertTrue(status.valid)
+        self.assertEqual(status.reason, "")
+        centroid_point = (150.0, 150.0)
+        self.assertTrue(manager.point_in_roi(centroid_point))
 
 
 if __name__ == "__main__":

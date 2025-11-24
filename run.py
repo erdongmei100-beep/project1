@@ -15,6 +15,7 @@ from ultralytics import YOLO
 from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
 from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
+from src.roi.manager import ROIManager
 from src.render.overlay import draw_overlays
 from src.utils.config import load_config, resolve_path
 from src.utils.paths import PROJECT_ROOT, project_path
@@ -130,6 +131,13 @@ def _overlay_lane_mask(frame: np.ndarray, mask: Optional[np.ndarray], color=(255
     overlay[mask] = color
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
     return frame
+
+
+def _bbox_quality(bbox: Tuple[float, float, float, float], confidence: Optional[float]) -> float:
+    x1, y1, x2, y2 = bbox
+    area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
+    conf = confidence if confidence is not None else 1.0
+    return float(area * conf)
 
 
 def export_events(events, output_csv: Path, fps: float) -> None:
@@ -294,6 +302,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     lane_predict_args: Dict[str, object] = {"verbose": False}
     if model_cfg.get("device") is not None:
         lane_predict_args["device"] = model_cfg.get("device", 0)
+    roi_manager = ROIManager()
 
     metadata = probe_video(source_path)
     print(
@@ -315,6 +324,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs_cfg["video_filename"] = f"{source_path.stem}.mp4"
     outputs_cfg["csv_filename"] = f"{source_path.stem}.csv"
+    snapshot_dir = output_dir / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     clip_pre_seconds = _get_float_config(outputs_cfg.get("clip_pre_seconds"), 1.0)
     clip_post_seconds = _get_float_config(outputs_cfg.get("clip_post_seconds"), 1.0)
@@ -325,6 +336,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     fps = metadata.fps or 25.0
     video_output_path = output_dir / f"{source_path.stem}.mp4"
     csv_output_path = output_dir / f"{source_path.stem}.csv"
+    best_snapshots: Dict[int, Dict[str, object]] = {}
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -351,6 +363,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 )
                 lane_mask = resized.astype(bool)
 
+            roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
+            roi_active = roi_status.valid
             ego_point = (frame_width / 2.0, frame_height - 1)
             ego_in_lane = _point_in_mask(ego_point, lane_mask)
 
@@ -388,7 +402,9 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                     x1, y1, x2, y2 = bbox[:4]
 
                     footpoint = ((x1 + x2) / 2.0, y2)
-                    inside = False if ego_in_lane else _point_in_mask(footpoint, lane_mask)
+                    inside = False
+                    if roi_active and not ego_in_lane:
+                        inside = roi_manager.point_in_roi(footpoint)
                     track_entries.append(
                         {
                             "track_id": track_id_int,
@@ -399,16 +415,52 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                         }
                     )
 
-            new_events = accumulator.update(frame_idx, track_entries)
-            for event in new_events:
+                    if inside and roi_active:
+                        quality = _bbox_quality((float(x1), float(y1), float(x2), float(y2)), conf)
+                        prev = best_snapshots.get(track_id_int)
+                        if not prev or quality > prev.get("quality", 0):
+                            best_snapshots[track_id_int] = {
+                                "frame": frame.copy(),
+                                "mask": lane_mask.copy() if lane_mask is not None else None,
+                                "bbox": (float(x1), float(y1), float(x2), float(y2)),
+                                "quality": quality,
+                            }
+
+            new_events = accumulator.update(frame_idx, track_entries, roi_active=roi_active)
+            completed_start = len(accumulator.completed) - len(new_events)
+            for offset, event in enumerate(new_events):
                 duration = event.duration_frames
+                event_id = completed_start + offset + 1
                 print(
                     f"Completed event: track {event.track_id} | frames {event.start_frame}-{event.end_frame} | duration {duration}"
                 )
+                best = best_snapshots.pop(event.track_id, None)
+                if best:
+                    snapshot = best["frame"].copy()
+                    _overlay_lane_mask(snapshot, best.get("mask"))
+                    bx1, by1, bx2, by2 = map(int, best["bbox"])
+                    cv2.rectangle(snapshot, (bx1, by1), (bx2, by2), (0, 0, 255), 3)
+                    cv2.putText(
+                        snapshot,
+                        f"Event {event_id} | Track {event.track_id}",
+                        (max(5, bx1), max(20, by1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 0, 255),
+                        2,
+                    )
+                    snap_path = snapshot_dir / f"event_{event_id:03d}.jpg"
+                    cv2.imwrite(str(snap_path), snapshot)
 
             annotated = frame.copy()
-            _overlay_lane_mask(annotated, lane_mask)
-            draw_overlays(annotated, None, track_entries, show_tracks, show_footpoints)
+            _overlay_lane_mask(annotated, lane_mask if roi_active else None)
+            draw_overlays(
+                annotated,
+                roi_status.polygon if roi_active else None,
+                track_entries,
+                show_tracks,
+                show_footpoints,
+            )
             if args.save_video and video_writer is not None:
                 video_writer.write(annotated)
 
