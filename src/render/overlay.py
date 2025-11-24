@@ -35,10 +35,12 @@ def draw_overlays(
         x1, y1, x2, y2 = map(int, bbox)
         inside = bool(record.get("inside"))
         track_id = record.get("track_id", "?")
-        color = (46, 204, 113) if inside else (231, 76, 60)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-        label = f"ID {track_id}{' IN' if inside else ''}"
-        cv2.putText(canvas, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        color = (231, 76, 60) if inside else (46, 204, 113)
+        thickness = 3 if inside else 1
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
+        status = " VIOLATION" if inside else ""
+        label = f"ID {track_id}{status}"
+        cv2.putText(canvas, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, max(2, thickness))
         if show_footpoints and record.get("footpoint"):
             fx, fy = record["footpoint"]
             cv2.circle(canvas, (int(fx), int(fy)), 4, color, -1)
