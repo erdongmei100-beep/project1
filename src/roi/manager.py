@@ -175,6 +175,7 @@ class ROIManager:
                                     reason = "unstable_centroid"
                             if not reason:
                                 valid = True
+                                reason = "ok"
                                 self._last_valid_centroid = centroid
 
         self._current_polygon = polygon
