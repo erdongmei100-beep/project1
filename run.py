@@ -528,7 +528,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                         2,
                     )
                     failure_path = failure_dir / f"frame_{frame_idx:06d}_{roi_reason}.jpg"
-                    cv2.imwrite(str(failure_path), failure_frame)
+                    cv2.imwrite(str(failure_path), frame)
                     last_failure_frame = frame_idx
 
             annotated = frame.copy()
