@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -53,6 +54,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--clip",
         action="store_true",
         help="Export per-event video clips with buffered context.",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Enable diagnostic logging and failure snapshots for ROI debugging.",
     )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
@@ -138,6 +144,22 @@ def _bbox_quality(bbox: Tuple[float, float, float, float], confidence: Optional[
     area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
     conf = confidence if confidence is not None else 1.0
     return float(area * conf)
+
+
+def _lane_metrics(mask: Optional[np.ndarray], frame_size: Tuple[int, int]) -> Tuple[float, Optional[float]]:
+    width, height = frame_size
+    total_pixels = float(width * height) if width > 0 and height > 0 else 1.0
+    if mask is None:
+        return 0.0, None
+
+    area = float(np.count_nonzero(mask))
+    area_ratio = area / total_pixels
+
+    moments = cv2.moments(mask.astype(np.uint8))
+    if moments["m00"] == 0:
+        return area_ratio, None
+    cx = moments["m10"] / moments["m00"]
+    return area_ratio, float(cx / width) if width > 0 else None
 
 
 def export_events(events, output_csv: Path, fps: float) -> None:
@@ -326,6 +348,10 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     outputs_cfg["csv_filename"] = f"{source_path.stem}.csv"
     snapshot_dir = output_dir / "snapshots"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+    failure_dir = output_dir / "failures"
+    debug_log_path = output_dir / "debug_log.csv"
+    if args.diagnose:
+        failure_dir.mkdir(parents=True, exist_ok=True)
 
     clip_pre_seconds = _get_float_config(outputs_cfg.get("clip_pre_seconds"), 1.0)
     clip_post_seconds = _get_float_config(outputs_cfg.get("clip_post_seconds"), 1.0)
@@ -337,6 +363,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     video_output_path = output_dir / f"{source_path.stem}.mp4"
     csv_output_path = output_dir / f"{source_path.stem}.csv"
     best_snapshots: Dict[int, Dict[str, object]] = {}
+    debug_rows: List[Dict[str, object]] = []
+    last_failure_frame = -int(math.ceil(fps))
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -365,11 +393,15 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
             roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
             roi_active = roi_status.valid
+            roi_reason = roi_status.reason or ("ok" if roi_active else "unknown")
             ego_point = (frame_width / 2.0, frame_height - 1)
             ego_in_lane = _point_in_mask(ego_point, lane_mask)
+            lane_area_ratio, lane_centroid_x = _lane_metrics(lane_mask, (frame_width, frame_height))
 
             boxes = getattr(result, "boxes", None)
             track_entries: List[Dict[str, object]] = []
+            num_vehicles_on_right = 0
+            coords_list: List[List[float]] = []
             if boxes is not None and boxes.id is not None:
                 ids = boxes.id
                 if hasattr(ids, "cpu"):
@@ -400,6 +432,10 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                         continue
                     conf = conf_list[idx] if idx < len(conf_list) else None
                     x1, y1, x2, y2 = bbox[:4]
+
+                    center_x = (float(x1) + float(x2)) / 2.0
+                    if frame_width > 0 and center_x / float(frame_width) > 0.6:
+                        num_vehicles_on_right += 1
 
                     footpoint = ((x1 + x2) / 2.0, y2)
                     inside = False
@@ -452,6 +488,49 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                     snap_path = snapshot_dir / f"event_{event_id:03d}.jpg"
                     cv2.imwrite(str(snap_path), snapshot)
 
+            if args.diagnose:
+                debug_rows.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "timestamp_s": float(frame_idx / fps) if fps else 0.0,
+                        "roi_active": int(roi_active),
+                        "roi_reason": roi_reason,
+                        "lane_area_ratio": lane_area_ratio,
+                        "lane_centroid_x": lane_centroid_x,
+                        "num_vehicles_on_right": num_vehicles_on_right,
+                    }
+                )
+
+                should_snapshot = (
+                    not roi_active
+                    and num_vehicles_on_right > 0
+                    and frame_idx - last_failure_frame >= int(max(1, round(fps)))
+                )
+                if should_snapshot:
+                    failure_frame = frame.copy()
+                    if lane_mask is not None:
+                        overlay = failure_frame.copy()
+                        overlay[lane_mask] = (255, 0, 0)
+                        cv2.addWeighted(overlay, 0.4, failure_frame, 0.6, 0, dst=failure_frame)
+                    if coords_list:
+                        for bbox in coords_list:
+                            if bbox is None or len(bbox) < 4:
+                                continue
+                            bx1, by1, bx2, by2 = map(int, bbox[:4])
+                            cv2.rectangle(failure_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                    cv2.putText(
+                        failure_frame,
+                        f"Frame {frame_idx} | reason: {roi_reason}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 0, 255),
+                        2,
+                    )
+                    failure_path = failure_dir / f"frame_{frame_idx:06d}_{roi_reason}.jpg"
+                    cv2.imwrite(str(failure_path), failure_frame)
+                    last_failure_frame = frame_idx
+
             annotated = frame.copy()
             _overlay_lane_mask(annotated, lane_mask if roi_active else None)
             draw_overlays(
@@ -470,6 +549,44 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
     accumulator.flush()
     events = list(accumulator.completed)
+    if args.diagnose and debug_rows:
+        debug_df = pd.DataFrame(debug_rows)
+        debug_df.to_csv(debug_log_path, index=False)
+        print(f"Saved diagnostic log to {debug_log_path}")
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+            times = debug_df["timestamp_s"].tolist()
+            ratios = debug_df["lane_area_ratio"].tolist()
+            roi_states = debug_df["roi_active"].tolist()
+            ax1.plot(times, ratios, label="lane_area_ratio", color="blue")
+            if times:
+                for idx in range(len(times) - 1):
+                    start_t = times[idx]
+                    end_t = times[idx + 1]
+                    color = "green" if roi_states[idx] else "red"
+                    ax1.axvspan(start_t, end_t, color=color, alpha=0.1)
+            ax1.set_xlabel("Time (s)")
+            ax1.set_ylabel("Lane area ratio")
+            ax1.set_title("Lane area ratio over time")
+            ax1.legend()
+
+            reasons = Counter(debug_df["roi_reason"].tolist())
+            ax2.bar(reasons.keys(), reasons.values(), color="purple")
+            ax2.set_ylabel("Count")
+            ax2.set_title("ROI rejection reasons")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+
+            report_path = output_dir / "report_analysis.png"
+            plt.savefig(report_path, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved diagnostic report to {report_path}")
+        except Exception as exc:  # pragma: no cover - best effort plotting
+            print(f"Skipping diagnostic plots due to error: {exc}")
+
     if args.save_csv:
         export_events(events, csv_output_path, fps)
 
