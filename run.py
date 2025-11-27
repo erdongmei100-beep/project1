@@ -324,7 +324,22 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     lane_predict_args: Dict[str, object] = {"verbose": False}
     if model_cfg.get("device") is not None:
         lane_predict_args["device"] = model_cfg.get("device", 0)
-    roi_manager = ROIManager()
+    roi_cfg = dict(config.get("roi") or {})
+    dynamic_filters = dict(roi_cfg.get("dynamic_filters") or {})
+    min_area_ratio = float(dynamic_filters.get("min_area_ratio", 0.005))
+    max_area_ratio = float(dynamic_filters.get("max_area_ratio", 0.4))
+    min_centroid_x_ratio = float(dynamic_filters.get("min_centroid_x_ratio", 0.55))
+    max_centroid_y_ratio = float(dynamic_filters.get("max_centroid_y_ratio", 0.55))
+    stability_ratio = float(dynamic_filters.get("max_centroid_jump", 0.25))
+    bad_streak_tolerance = max(int(dynamic_filters.get("bad_streak_tolerance", 5)), 0)
+    good_streak_required = max(int(dynamic_filters.get("good_streak", 5)), 1)
+
+    roi_manager = ROIManager(
+        min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio,
+        expected_centroid=(min_centroid_x_ratio, max_centroid_y_ratio),
+        stability_ratio=stability_ratio,
+    )
 
     metadata = probe_video(source_path)
     print(
@@ -365,6 +380,10 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     best_snapshots: Dict[int, Dict[str, object]] = {}
     debug_rows: List[Dict[str, object]] = []
     last_failure_frame = -int(math.ceil(fps))
+    roi_active = False
+    roi_good_streak = 0
+    roi_bad_streak = 0
+    roi_reason = "uninitialized"
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -392,8 +411,21 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 lane_mask = resized.astype(bool)
 
             roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
-            roi_active = roi_status.valid
-            roi_reason = roi_status.reason or ("ok" if roi_active else "unknown")
+            roi_reason = roi_status.reason or ("ok" if roi_status.valid else "unknown")
+            if roi_status.valid:
+                roi_bad_streak = 0
+                roi_good_streak = min(roi_good_streak + 1, good_streak_required)
+                if not roi_active and roi_good_streak >= good_streak_required:
+                    roi_active = True
+            else:
+                roi_good_streak = 0
+                if roi_active:
+                    roi_bad_streak += 1
+                    if roi_bad_streak > bad_streak_tolerance:
+                        roi_active = False
+                        roi_bad_streak = 0
+                else:
+                    roi_bad_streak = 0
             ego_point = (frame_width / 2.0, frame_height - 1)
             ego_in_lane = _point_in_mask(ego_point, lane_mask)
             lane_area_ratio, lane_centroid_x = _lane_metrics(lane_mask, (frame_width, frame_height))
