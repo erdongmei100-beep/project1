@@ -82,16 +82,8 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
     )
 
 
-def _extract_emergency_lane_mask(result, class_name: str = "emergency_lane") -> Optional[np.ndarray]:
+def _extract_emergency_lane_mask(result, target_class_id: int) -> Optional[np.ndarray]:
     if result is None or result.masks is None or result.boxes is None:
-        return None
-
-    target_class_id = None
-    for cls_id, name in (result.names or {}).items():
-        if name == class_name:
-            target_class_id = int(cls_id)
-            break
-    if target_class_id is None:
         return None
 
     masks_data = result.masks.data
@@ -111,7 +103,7 @@ def _extract_emergency_lane_mask(result, class_name: str = "emergency_lane") -> 
 
     combined_mask: Optional[np.ndarray] = None
     for idx, cls_id in enumerate(class_ids_np):
-        if int(cls_id) != target_class_id:
+        if int(cls_id) != int(target_class_id):
             continue
         if idx >= masks_np.shape[0]:
             continue
@@ -320,13 +312,22 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
     tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
 
+    roi_cfg = config.get("roi", {}) or {}
+    dynamic_seg_cfg = dict(roi_cfg.get("dynamic_seg") or {})
+    lane_conf = dynamic_seg_cfg.get("conf")
+    lane_imgsz = dynamic_seg_cfg.get("imgsz")
+    lane_class_id = int(dynamic_seg_cfg.get("class_id", 0))
+
     lane_weights_path = resolve_path(PROJECT_ROOT, args.lane_weights)
     lane_model = YOLO(str(lane_weights_path))
     lane_predict_args: Dict[str, object] = {"verbose": False}
     if model_cfg.get("device") is not None:
         lane_predict_args["device"] = model_cfg.get("device", 0)
+    if lane_conf is not None:
+        lane_predict_args["conf"] = float(lane_conf)
+    if lane_imgsz is not None:
+        lane_predict_args["imgsz"] = int(lane_imgsz)
 
-    roi_cfg = config.get("roi", {}) or {}
     filters_cfg = dict(roi_cfg.get("dynamic_filters") or {})
     roi_manager = ROIManager(
         min_area_ratio=float(filters_cfg.get("min_area_ratio", 0.005)),
@@ -404,15 +405,21 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
             lane_results = lane_model.predict(source=frame, **lane_predict_args)
             frame_height, frame_width = frame.shape[:2]
             lane_result = lane_results[0] if lane_results else None
-            lane_mask = _extract_emergency_lane_mask(lane_result)
+            lane_mask = _extract_emergency_lane_mask(lane_result, lane_class_id)
             if lane_mask is not None and lane_mask.shape[:2] != (frame_height, frame_width):
                 resized = cv2.resize(
                     lane_mask.astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_NEAREST
                 )
                 lane_mask = resized.astype(bool)
 
+            if lane_mask is None:
+                print(f"[DEBUG] Frame {frame_idx}: YOLO detected no mask for class {lane_class_id}")
+
             roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
             roi_polygon = roi_status.polygon
+
+            if not roi_status.valid:
+                print(f"[DEBUG] Frame {frame_idx}: ROI rejected by Manager. Reason: {roi_status.reason}")
 
             if roi_status.valid:
                 current_good_streak += 1
