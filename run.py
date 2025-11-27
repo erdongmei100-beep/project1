@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import pandas as pd
 from ultralytics import YOLO
+from ultralytics.utils.ops import scale_masks
+import torch
 
 from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
@@ -84,11 +86,14 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
 
 def _extract_emergency_lane_mask(
     result,
+    frame_shape: Tuple[int, int],
     class_name: str = "emergency_lane",
     fallback_class_id: int = 0,
 ) -> Optional[np.ndarray]:
     if result is None or result.masks is None or result.boxes is None:
         return None
+
+    frame_height, frame_width = frame_shape
 
     target_class_id: Optional[int] = None
     names = getattr(result, "names", None) or {}
@@ -105,10 +110,15 @@ def _extract_emergency_lane_mask(
     if masks_data is None or class_ids is None:
         return None
 
-    if hasattr(masks_data, "cpu"):
-        masks_np = masks_data.cpu().numpy()
-    else:
-        masks_np = np.asarray(masks_data)
+    masks_tensor = torch.as_tensor(masks_data)
+    if masks_tensor.ndim == 2:
+        masks_tensor = masks_tensor.unsqueeze(0).unsqueeze(0)
+    elif masks_tensor.ndim == 3:
+        masks_tensor = masks_tensor.unsqueeze(1)
+    elif masks_tensor.ndim != 4:
+        return None
+
+    scaled_masks = scale_masks(masks_tensor.float(), (frame_height, frame_width)).squeeze(1)
 
     if hasattr(class_ids, "cpu"):
         class_ids_np = class_ids.cpu().numpy()
@@ -116,12 +126,14 @@ def _extract_emergency_lane_mask(
         class_ids_np = np.asarray(class_ids)
 
     combined_mask: Optional[np.ndarray] = None
+    scaled_masks_np = scaled_masks.cpu().numpy()
+
     for idx, cls_id in enumerate(class_ids_np):
         if int(cls_id) != target_class_id:
             continue
-        if idx >= masks_np.shape[0]:
+        if idx >= scaled_masks_np.shape[0]:
             continue
-        current_mask = masks_np[idx] > 0.5
+        current_mask = scaled_masks_np[idx] > 0.5
         combined_mask = current_mask if combined_mask is None else (combined_mask | current_mask)
 
     return combined_mask
@@ -337,6 +349,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     lane_model = YOLO(str(lane_weights_path))
     print(f"Lane model classes: {lane_model.names}")
     lane_predict_args: Dict[str, object] = {"verbose": False}
+    lane_predict_args["retina_masks"] = False
     if model_cfg.get("device") is not None:
         lane_predict_args["device"] = model_cfg.get("device", 0)
     if lane_conf is not None:
@@ -425,14 +438,10 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
             lane_result = lane_results[0] if lane_results else None
             lane_mask = _extract_emergency_lane_mask(
                 lane_result,
+                (frame_height, frame_width),
                 class_name=lane_class_name,
                 fallback_class_id=lane_class_id,
             )
-            if lane_mask is not None and lane_mask.shape[:2] != (frame_height, frame_width):
-                resized = cv2.resize(
-                    lane_mask.astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_NEAREST
-                )
-                lane_mask = resized.astype(bool)
 
             if lane_mask is None:
                 print(f"[DEBUG] Frame {frame_idx}: YOLO detected no mask for class {lane_class_id}")
