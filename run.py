@@ -19,6 +19,7 @@ from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.roi.manager import ROIManager
 from src.render.overlay import draw_overlays
 from src.utils.config import load_config, resolve_path
+from src.utils.geometry import point_in_polygon
 from src.utils.paths import PROJECT_ROOT, project_path
 
 
@@ -471,8 +472,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
                     footpoint = ((x1 + x2) / 2.0, y2)
                     inside = False
-                    if roi_active and not ego_in_lane:
-                        inside = roi_manager.point_in_roi(footpoint)
+                    if roi_active and not ego_in_lane and active_polygon:
+                        inside = point_in_polygon(footpoint, active_polygon)
                     track_entries.append(
                         {
                             "track_id": track_id_int,
@@ -567,7 +568,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
             _overlay_lane_mask(annotated, lane_mask if roi_active else None)
             draw_overlays(
                 annotated,
-                roi_status.polygon if roi_active else None,
+                active_polygon if roi_active else None,
                 track_entries,
                 show_tracks,
                 show_footpoints,
