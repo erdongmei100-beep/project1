@@ -28,12 +28,12 @@ roi:
   dynamic_filters:
     # 1. 面积过滤：防止碎渣误报
     # 如果报错 area_out_of_range 太多，就把这个由 0.015 改小到 0.001
-    min_area_ratio: 0.001
+    min_area_ratio: 0.0001
     max_area_ratio: 0.4
 
     # 2. 位置过滤：防止副驾视角偏差
     # 如果报错 centroid_out_of_position 太多，就把这个由 0.7 改小到 0.5
-    min_centroid_x_ratio: 0.5
+    min_centroid_x_ratio: 0.4
     max_centroid_y_ratio: 0.98
 
     # 3. 稳定性过滤：防抖动
@@ -41,7 +41,7 @@ roi:
 
     # 4. 状态机：允许掉线的帧数
     # 调大这个值（比如 10），可以让车道识别更不容易断，哪怕被车挡住也能坚持一会
-    bad_streak_tolerance: 30
+    bad_streak_tolerance: 60
     good_streak: 5
 # ... 下面的 events, render 等保持不变 ...
 events:
