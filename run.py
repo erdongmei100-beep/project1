@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import pandas as pd
 from ultralytics import YOLO
+from ultralytics.utils.ops import scale_masks
+import torch
 
 from src.dettrack.pipeline import DetectorTracker
 from src.io.video import VideoMetadata, probe_video
@@ -82,19 +84,41 @@ def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> Detect
     )
 
 
-def _extract_emergency_lane_mask(result, target_class_id: int) -> Optional[np.ndarray]:
+def _extract_emergency_lane_mask(
+    result,
+    frame_shape: Tuple[int, int],
+    class_name: str = "emergency_lane",
+    fallback_class_id: int = 0,
+) -> Optional[np.ndarray]:
     if result is None or result.masks is None or result.boxes is None:
         return None
+
+    frame_height, frame_width = frame_shape
+
+    target_class_id: Optional[int] = None
+    names = getattr(result, "names", None) or {}
+    for cls_id, name in names.items():
+        if name == class_name:
+            target_class_id = int(cls_id)
+            break
+
+    if target_class_id is None:
+        target_class_id = int(fallback_class_id)
 
     masks_data = result.masks.data
     class_ids = result.boxes.cls
     if masks_data is None or class_ids is None:
         return None
 
-    if hasattr(masks_data, "cpu"):
-        masks_np = masks_data.cpu().numpy()
-    else:
-        masks_np = np.asarray(masks_data)
+    masks_tensor = torch.as_tensor(masks_data)
+    if masks_tensor.ndim == 2:
+        masks_tensor = masks_tensor.unsqueeze(0).unsqueeze(0)
+    elif masks_tensor.ndim == 3:
+        masks_tensor = masks_tensor.unsqueeze(1)
+    elif masks_tensor.ndim != 4:
+        return None
+
+    scaled_masks = scale_masks(masks_tensor.float(), (frame_height, frame_width)).squeeze(1)
 
     if hasattr(class_ids, "cpu"):
         class_ids_np = class_ids.cpu().numpy()
@@ -102,12 +126,14 @@ def _extract_emergency_lane_mask(result, target_class_id: int) -> Optional[np.nd
         class_ids_np = np.asarray(class_ids)
 
     combined_mask: Optional[np.ndarray] = None
+    scaled_masks_np = scaled_masks.cpu().numpy()
+
     for idx, cls_id in enumerate(class_ids_np):
-        if int(cls_id) != int(target_class_id):
+        if int(cls_id) != target_class_id:
             continue
-        if idx >= masks_np.shape[0]:
+        if idx >= scaled_masks_np.shape[0]:
             continue
-        current_mask = masks_np[idx] > 0.5
+        current_mask = scaled_masks_np[idx] > 0.5
         combined_mask = current_mask if combined_mask is None else (combined_mask | current_mask)
 
     return combined_mask
@@ -317,10 +343,13 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     lane_conf = dynamic_seg_cfg.get("conf")
     lane_imgsz = dynamic_seg_cfg.get("imgsz")
     lane_class_id = int(dynamic_seg_cfg.get("class_id", 0))
+    lane_class_name = str(dynamic_seg_cfg.get("class_name", "emergency_lane"))
 
     lane_weights_path = resolve_path(PROJECT_ROOT, args.lane_weights)
     lane_model = YOLO(str(lane_weights_path))
+    print(f"Lane model classes: {lane_model.names}")
     lane_predict_args: Dict[str, object] = {"verbose": False}
+    lane_predict_args["retina_masks"] = False
     if model_cfg.get("device") is not None:
         lane_predict_args["device"] = model_cfg.get("device", 0)
     if lane_conf is not None:
@@ -334,12 +363,17 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
         max_area_ratio=float(filters_cfg.get("max_area_ratio", 0.4)),
         expected_centroid=(
             float(filters_cfg.get("min_centroid_x_ratio", 0.55)),
-            float(filters_cfg.get("max_centroid_y_ratio", 0.55)),
+            float(
+                filters_cfg.get(
+                    "min_centroid_y_ratio",
+                    filters_cfg.get("max_centroid_y_ratio", 0.55),
+                )
+            ),
         ),
         stability_ratio=float(filters_cfg.get("max_centroid_jump", 0.25)),
+        good_streak_thresh=int(filters_cfg.get("good_streak", 5)),
+        bad_streak_tolerance=int(filters_cfg.get("bad_streak_tolerance", 5)),
     )
-    bad_streak_tolerance = int(filters_cfg.get("bad_streak_tolerance", 5))
-    good_streak = int(filters_cfg.get("good_streak", 5))
 
     metadata = probe_video(source_path)
     print(
@@ -383,9 +417,6 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     roi_active = False
     roi_reason = "uninitialized"
     active_polygon: List[Tuple[float, float]] = []
-    last_valid_polygon: List[Tuple[float, float]] = []
-    current_bad_streak = 0
-    current_good_streak = 0
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -405,49 +436,24 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
             lane_results = lane_model.predict(source=frame, **lane_predict_args)
             frame_height, frame_width = frame.shape[:2]
             lane_result = lane_results[0] if lane_results else None
-            lane_mask = _extract_emergency_lane_mask(lane_result, lane_class_id)
-            if lane_mask is not None and lane_mask.shape[:2] != (frame_height, frame_width):
-                resized = cv2.resize(
-                    lane_mask.astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_NEAREST
-                )
-                lane_mask = resized.astype(bool)
+            lane_mask = _extract_emergency_lane_mask(
+                lane_result,
+                (frame_height, frame_width),
+                class_name=lane_class_name,
+                fallback_class_id=lane_class_id,
+            )
 
             if lane_mask is None:
                 print(f"[DEBUG] Frame {frame_idx}: YOLO detected no mask for class {lane_class_id}")
 
             roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
-            roi_polygon = roi_status.polygon
-
             if not roi_status.valid:
                 print(f"[DEBUG] Frame {frame_idx}: ROI rejected by Manager. Reason: {roi_status.reason}")
 
-            if roi_status.valid:
-                current_good_streak += 1
-                current_bad_streak = 0
-                if roi_polygon:
-                    last_valid_polygon = roi_polygon
-            else:
-                current_good_streak = 0
-                current_bad_streak += 1
+            roi_active = roi_status.valid
+            active_polygon = roi_status.polygon if roi_active else []
 
-            if roi_status.valid and not roi_active:
-                roi_active = current_good_streak >= good_streak
-            elif not roi_status.valid and roi_active and current_bad_streak > bad_streak_tolerance:
-                roi_active = False
-
-            if roi_active:
-                if roi_status.valid and roi_polygon:
-                    active_polygon = roi_polygon
-                elif last_valid_polygon:
-                    active_polygon = last_valid_polygon
-            else:
-                active_polygon = []
-
-            roi_reason = roi_status.reason or ("ok" if roi_status.valid else "unknown")
-            if roi_active and not roi_status.valid:
-                roi_reason = f"tolerating_{roi_reason}"
-            if not roi_active and current_bad_streak > bad_streak_tolerance:
-                roi_reason = "bad_streak_exceeded"
+            roi_reason = roi_status.reason or ("ok" if roi_active else "unknown")
             ego_point = (frame_width / 2.0, frame_height - 1)
             ego_in_lane = _point_in_mask(ego_point, lane_mask)
             lane_area_ratio, lane_centroid_x = _lane_metrics(lane_mask, (frame_width, frame_height))
@@ -582,7 +588,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                         2,
                     )
                     failure_path = failure_dir / f"frame_{frame_idx:06d}_{roi_reason}.jpg"
-                    cv2.imwrite(str(failure_path), frame)
+                    cv2.imwrite(str(failure_path), failure_frame)
                     last_failure_frame = frame_idx
 
             annotated = frame.copy()
