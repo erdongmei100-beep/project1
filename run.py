@@ -19,6 +19,7 @@ from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
 from src.roi.manager import ROIManager
 from src.render.overlay import draw_overlays
 from src.utils.config import load_config, resolve_path
+from src.utils.geometry import point_in_polygon
 from src.utils.paths import PROJECT_ROOT, project_path
 
 
@@ -324,7 +325,20 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     lane_predict_args: Dict[str, object] = {"verbose": False}
     if model_cfg.get("device") is not None:
         lane_predict_args["device"] = model_cfg.get("device", 0)
-    roi_manager = ROIManager()
+
+    roi_cfg = config.get("roi", {}) or {}
+    filters_cfg = dict(roi_cfg.get("dynamic_filters") or {})
+    roi_manager = ROIManager(
+        min_area_ratio=float(filters_cfg.get("min_area_ratio", 0.005)),
+        max_area_ratio=float(filters_cfg.get("max_area_ratio", 0.4)),
+        expected_centroid=(
+            float(filters_cfg.get("min_centroid_x_ratio", 0.55)),
+            float(filters_cfg.get("max_centroid_y_ratio", 0.55)),
+        ),
+        stability_ratio=float(filters_cfg.get("max_centroid_jump", 0.25)),
+    )
+    bad_streak_tolerance = int(filters_cfg.get("bad_streak_tolerance", 5))
+    good_streak = int(filters_cfg.get("good_streak", 5))
 
     metadata = probe_video(source_path)
     print(
@@ -365,6 +379,12 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     best_snapshots: Dict[int, Dict[str, object]] = {}
     debug_rows: List[Dict[str, object]] = []
     last_failure_frame = -int(math.ceil(fps))
+    roi_active = False
+    roi_reason = "uninitialized"
+    active_polygon: List[Tuple[float, float]] = []
+    last_valid_polygon: List[Tuple[float, float]] = []
+    current_bad_streak = 0
+    current_good_streak = 0
 
     try:
         for frame_idx, result in enumerate(tracker.track(source_path)):
@@ -392,8 +412,35 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 lane_mask = resized.astype(bool)
 
             roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
-            roi_active = roi_status.valid
-            roi_reason = roi_status.reason or ("ok" if roi_active else "unknown")
+            roi_polygon = roi_status.polygon
+
+            if roi_status.valid:
+                current_good_streak += 1
+                current_bad_streak = 0
+                if roi_polygon:
+                    last_valid_polygon = roi_polygon
+            else:
+                current_good_streak = 0
+                current_bad_streak += 1
+
+            if roi_status.valid and not roi_active:
+                roi_active = current_good_streak >= good_streak
+            elif not roi_status.valid and roi_active and current_bad_streak > bad_streak_tolerance:
+                roi_active = False
+
+            if roi_active:
+                if roi_status.valid and roi_polygon:
+                    active_polygon = roi_polygon
+                elif last_valid_polygon:
+                    active_polygon = last_valid_polygon
+            else:
+                active_polygon = []
+
+            roi_reason = roi_status.reason or ("ok" if roi_status.valid else "unknown")
+            if roi_active and not roi_status.valid:
+                roi_reason = f"tolerating_{roi_reason}"
+            if not roi_active and current_bad_streak > bad_streak_tolerance:
+                roi_reason = "bad_streak_exceeded"
             ego_point = (frame_width / 2.0, frame_height - 1)
             ego_in_lane = _point_in_mask(ego_point, lane_mask)
             lane_area_ratio, lane_centroid_x = _lane_metrics(lane_mask, (frame_width, frame_height))
@@ -439,8 +486,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
                     footpoint = ((x1 + x2) / 2.0, y2)
                     inside = False
-                    if roi_active and not ego_in_lane:
-                        inside = roi_manager.point_in_roi(footpoint)
+                    if roi_active and not ego_in_lane and active_polygon:
+                        inside = point_in_polygon(footpoint, active_polygon)
                     track_entries.append(
                         {
                             "track_id": track_id_int,
@@ -535,7 +582,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
             _overlay_lane_mask(annotated, lane_mask if roi_active else None)
             draw_overlays(
                 annotated,
-                roi_status.polygon if roi_active else None,
+                active_polygon if roi_active else None,
                 track_entries,
                 show_tracks,
                 show_footpoints,
