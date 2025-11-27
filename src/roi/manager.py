@@ -39,18 +39,27 @@ class ROIManager:
         max_area_ratio: float = 0.4,
         expected_centroid: Tuple[float, float] = (0.55, 0.55),
         stability_ratio: float = 0.25,
+        good_streak_thresh: int = 1,
+        bad_streak_tolerance: int = 5,
     ) -> None:
         self.roi_path = Path(roi_path) if roi_path is not None else None
         self.min_area_ratio = min_area_ratio
         self.max_area_ratio = max_area_ratio
         self.expected_centroid = expected_centroid
         self.stability_ratio = stability_ratio
+        self.good_streak_thresh = int(good_streak_thresh)
+        self.bad_streak_tolerance = int(bad_streak_tolerance)
 
         self._config: Optional[ROIConfig] = None
         self._scaled_polygon: Optional[List[Point]] = None
         self._current_polygon: List[Point] = []
+        self._dynamic_polygon: List[Point] = []
         self._last_valid_centroid: Optional[Tuple[float, float]] = None
         self._last_status: Optional[ROIStatus] = None
+
+        self.good_streak = 0
+        self.bad_streak = 0
+        self.is_active = False
 
     def load(self) -> None:
         if self.roi_path is None:
@@ -80,6 +89,8 @@ class ROIManager:
 
     @property
     def polygon(self) -> List[Point]:
+        if self.is_active and self._dynamic_polygon:
+            return self._dynamic_polygon
         if self._current_polygon:
             return self._current_polygon
         if self._scaled_polygon is not None:
@@ -89,7 +100,7 @@ class ROIManager:
         return self._config.polygon
 
     def point_in_roi(self, point: Point) -> bool:
-        polygon = self._current_polygon
+        polygon = self._dynamic_polygon if (self.is_active and self._dynamic_polygon) else self._current_polygon
         if not polygon:
             polygon = self._scaled_polygon or (self._config.polygon if self._config else [])
         if not polygon:
@@ -135,8 +146,8 @@ class ROIManager:
     ) -> ROIStatus:
         width, height = frame_size
         reason = ""
-        valid = False
         polygon: List[Point] = []
+        frame_valid = False
 
         if mask is None:
             reason = "no_mask"
@@ -174,12 +185,26 @@ class ROIManager:
                                 if dist > diag * self.stability_ratio:
                                     reason = "unstable_centroid"
                             if not reason:
-                                valid = True
-                                reason = "ok"
+                                frame_valid = True
                                 self._last_valid_centroid = centroid
 
+        if frame_valid:
+            self.good_streak += 1
+            self.bad_streak = 0
+            self._dynamic_polygon = polygon
+            if self.good_streak >= self.good_streak_thresh:
+                self.is_active = True
+        else:
+            self.good_streak = 0
+            self.bad_streak += 1
+            if self.bad_streak > self.bad_streak_tolerance:
+                self.is_active = False
+                self._dynamic_polygon = []
+
         self._current_polygon = polygon
-        status = ROIStatus(polygon=polygon, valid=valid, reason=reason)
+        status_polygon = self._dynamic_polygon if self.is_active else []
+        status_reason = "" if self.is_active else reason
+        status = ROIStatus(polygon=status_polygon, valid=self.is_active, reason=status_reason)
         self._last_status = status
         return status
 
