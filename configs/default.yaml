@@ -18,7 +18,7 @@ roi:
   # 动态分割模型的配置
   dynamic_seg:
     # 指向您训练好的模型
-    model: weights/lane_seg.pt
+    model: weights/lane_seg_v2.pt
     device: 0
     imgsz: 640
     conf: 0.25
