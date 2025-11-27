@@ -145,66 +145,29 @@ class ROIManager:
         self, mask: Optional[np.ndarray], frame_size: Tuple[int, int]
     ) -> ROIStatus:
         width, height = frame_size
-        reason = ""
         polygon: List[Point] = []
-        frame_valid = False
 
-        if mask is None:
-            reason = "no_mask"
-        else:
+        if mask is not None:
             if mask.shape[:2] != (height, width):
                 mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
                 mask = mask.astype(bool)
 
             polygon = self._mask_to_polygon(mask)
-            if not polygon:
-                reason = "no_contour"
-            else:
-                area = float(cv2.contourArea(np.array(polygon, dtype=np.float32)))
-                area_ratio = area / float(width * height)
-                if area_ratio < self.min_area_ratio or area_ratio > self.max_area_ratio:
-                    reason = "area_out_of_range"
-                else:
-                    centroid = self._centroid(polygon)
-                    if centroid is None:
-                        reason = "no_centroid"
-                    else:
-                        cx, cy = centroid
-                        exp_x = width * self.expected_centroid[0]
-                        exp_y = height * self.expected_centroid[1]
-                        if cx < exp_x or cy < exp_y:
-                            reason = "centroid_out_of_position"
-                        elif self._ego_covered(mask, frame_size):
-                            reason = "ego_vehicle"
-                        else:
-                            if self._last_valid_centroid is not None:
-                                dx = cx - self._last_valid_centroid[0]
-                                dy = cy - self._last_valid_centroid[1]
-                                dist = float(np.hypot(dx, dy))
-                                diag = float(np.hypot(width, height))
-                                if dist > diag * self.stability_ratio:
-                                    reason = "unstable_centroid"
-                            if not reason:
-                                frame_valid = True
-                                self._last_valid_centroid = centroid
 
-        if frame_valid:
-            self.good_streak += 1
-            self.bad_streak = 0
+        if polygon:
+            self.is_active = True
             self._dynamic_polygon = polygon
-            if self.good_streak >= self.good_streak_thresh:
-                self.is_active = True
+            reason = "raw_pass"
+            valid = True
         else:
-            self.good_streak = 0
-            self.bad_streak += 1
-            if self.bad_streak > self.bad_streak_tolerance:
-                self.is_active = False
-                self._dynamic_polygon = []
+            self.is_active = False
+            self._dynamic_polygon = []
+            reason = "no_mask_from_yolo"
+            valid = False
 
         self._current_polygon = polygon
         status_polygon = self._dynamic_polygon if self.is_active else []
-        status_reason = "" if self.is_active else reason
-        status = ROIStatus(polygon=status_polygon, valid=self.is_active, reason=status_reason)
+        status = ROIStatus(polygon=status_polygon, valid=valid, reason=reason)
         self._last_status = status
         return status
 
