@@ -22,7 +22,7 @@ roi:
     device: 0
     imgsz: 640
     conf: 0.25
-    class_id: 1
+    class_id: 0
 
   # 【这里就是您找不到的过滤参数，请完整复制进去】
   dynamic_filters:
