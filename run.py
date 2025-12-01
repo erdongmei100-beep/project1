@@ -12,7 +12,6 @@ import cv2
 import numpy as np
 import pandas as pd
 from ultralytics import YOLO
-from ultralytics.utils.ops import scale_masks
 import torch
 
 from src.dettrack.pipeline import DetectorTracker
@@ -105,38 +104,19 @@ def _extract_emergency_lane_mask(
     if target_class_id is None:
         target_class_id = int(fallback_class_id)
 
-    masks_data = result.masks.data
     class_ids = result.boxes.cls
-    if masks_data is None or class_ids is None:
+    if class_ids is None:
         return None
 
-    masks_tensor = torch.as_tensor(masks_data)
-    if masks_tensor.ndim == 2:
-        masks_tensor = masks_tensor.unsqueeze(0).unsqueeze(0)
-    elif masks_tensor.ndim == 3:
-        masks_tensor = masks_tensor.unsqueeze(1)
-    elif masks_tensor.ndim != 4:
-        return None
+    cls_ids = class_ids.cpu().numpy() if hasattr(class_ids, "cpu") else np.asarray(class_ids)
+    polygons = getattr(result.masks, "xy", None) or []
+    mask_img = np.zeros((frame_height, frame_width), dtype=np.uint8)
 
-    scaled_masks = scale_masks(masks_tensor.float(), (frame_height, frame_width)).squeeze(1)
+    for polygon, cls_id in zip(polygons, cls_ids):
+        if int(cls_id) == target_class_id:
+            cv2.fillPoly(mask_img, [polygon.astype(np.int32)], 1)
 
-    if hasattr(class_ids, "cpu"):
-        class_ids_np = class_ids.cpu().numpy()
-    else:
-        class_ids_np = np.asarray(class_ids)
-
-    combined_mask: Optional[np.ndarray] = None
-    scaled_masks_np = scaled_masks.cpu().numpy()
-
-    for idx, cls_id in enumerate(class_ids_np):
-        if int(cls_id) != target_class_id:
-            continue
-        if idx >= scaled_masks_np.shape[0]:
-            continue
-        current_mask = scaled_masks_np[idx] > 0.5
-        combined_mask = current_mask if combined_mask is None else (combined_mask | current_mask)
-
-    return combined_mask
+    return mask_img.astype(bool) if np.any(mask_img) else None
 
 
 def _point_in_mask(point: Tuple[float, float], mask: Optional[np.ndarray]) -> bool:
@@ -435,13 +415,19 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
             lane_results = lane_model.predict(source=frame, **lane_predict_args)
             frame_height, frame_width = frame.shape[:2]
-            lane_result = lane_results[0] if lane_results else None
-            lane_mask = _extract_emergency_lane_mask(
-                lane_result,
-                (frame_height, frame_width),
-                class_name=lane_class_name,
-                fallback_class_id=lane_class_id,
-            )
+            lane_mask: Optional[np.ndarray] = None
+            if lane_results and lane_results[0].masks is not None:
+                lane_result = lane_results[0]
+                lane_mask_img = np.zeros(frame.shape[:2], dtype=np.uint8)
+                polygons = lane_result.masks.xy or []
+                class_ids = lane_result.boxes.cls if lane_result.boxes is not None else None
+                cls_ids = class_ids.cpu().numpy() if hasattr(class_ids, "cpu") else np.asarray(class_ids) if class_ids is not None else None
+                if cls_ids is not None:
+                    for polygon, cls_id in zip(polygons, cls_ids):
+                        if int(cls_id) == lane_class_id:
+                            cv2.fillPoly(lane_mask_img, [polygon.astype(np.int32)], 1)
+                if np.any(lane_mask_img):
+                    lane_mask = lane_mask_img.astype(bool)
 
             if lane_mask is None:
                 print(f"[DEBUG] Frame {frame_idx}: YOLO detected no mask for class {lane_class_id}")
