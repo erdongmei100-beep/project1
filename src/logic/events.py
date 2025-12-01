@@ -57,10 +57,10 @@ class EventAccumulator:
     def update(
         self, frame_idx: int, track_records: Iterable[dict], *, roi_active: bool = True
     ) -> List[OccupancyEvent]:
+        if not roi_active:
+            return []
         present_ids = set()
         new_events: List[OccupancyEvent] = []
-
-        neutral_frame = not roi_active
 
         for record in track_records:
             track_id = int(record["track_id"])
@@ -71,9 +71,6 @@ class EventAccumulator:
 
             state = self._states.setdefault(track_id, _TrackState())
             present_ids.add(track_id)
-
-            if neutral_frame:
-                continue
 
             if inside:
                 state.inside_streak += 1
@@ -110,18 +107,17 @@ class EventAccumulator:
                     state.outside_streak = min(state.outside_streak + 1, self.min_frames_out)
 
         # Handle tracks that were not observed in this frame.
-        if not neutral_frame:
-            missing_ids = set(self._states.keys()) - present_ids
-            for track_id in list(missing_ids):
-                state = self._states[track_id]
-                if state.active:
-                    state.outside_streak += 1
-                    if state.outside_streak >= self.min_frames_out:
-                        event = self._close_event(track_id, state)
-                        if event:
-                            new_events.append(event)
-                else:
-                    del self._states[track_id]
+        missing_ids = set(self._states.keys()) - present_ids
+        for track_id in list(missing_ids):
+            state = self._states[track_id]
+            if state.active:
+                state.outside_streak += 1
+                if state.outside_streak >= self.min_frames_out:
+                    event = self._close_event(track_id, state)
+                    if event:
+                        new_events.append(event)
+            else:
+                del self._states[track_id]
 
         self.completed.extend(new_events)
         return new_events

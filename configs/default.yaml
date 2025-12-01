@@ -46,7 +46,7 @@ roi:
 # ... 下面的 events, render 等保持不变 ...
 events:
   min_frames_in: 5
-  min_frames_out: 5
+  min_frames_out: 30
 render:
   show_tracks: true
   show_footpoints: true
