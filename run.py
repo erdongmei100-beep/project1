@@ -435,13 +435,25 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
             lane_results = lane_model.predict(source=frame, **lane_predict_args)
             frame_height, frame_width = frame.shape[:2]
-            lane_result = lane_results[0] if lane_results else None
-            lane_mask = _extract_emergency_lane_mask(
-                lane_result,
-                (frame_height, frame_width),
-                class_name=lane_class_name,
-                fallback_class_id=lane_class_id,
-            )
+            lane_mask: Optional[np.ndarray] = None
+            if lane_results and lane_results[0].masks is not None:
+                lane_result = lane_results[0]
+                scaled_masks = scale_masks(
+                    lane_result.masks.data,
+                    frame.shape[:2],
+                    lane_result.orig_img.shape,
+                )
+                scaled_masks_np = scaled_masks.cpu().numpy()
+                class_ids = lane_result.boxes.cls if lane_result.boxes is not None else None
+                if class_ids is not None:
+                    class_ids_np = class_ids.cpu().numpy() if hasattr(class_ids, "cpu") else np.asarray(class_ids)
+                    for idx, cls_id in enumerate(class_ids_np):
+                        if int(cls_id) != lane_class_id:
+                            continue
+                        if idx >= scaled_masks_np.shape[0]:
+                            continue
+                        current_mask = scaled_masks_np[idx] > 0.5
+                        lane_mask = current_mask if lane_mask is None else (lane_mask | current_mask)
 
             if lane_mask is None:
                 print(f"[DEBUG] Frame {frame_idx}: YOLO detected no mask for class {lane_class_id}")
