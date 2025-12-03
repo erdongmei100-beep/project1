@@ -391,7 +391,6 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     fps = metadata.fps or 25.0
     video_output_path = output_dir / f"{source_path.stem}.mp4"
     csv_output_path = output_dir / f"{source_path.stem}.csv"
-    best_snapshots: Dict[int, Dict[str, object]] = {}
     debug_rows: List[Dict[str, object]] = []
     last_failure_frame = -int(math.ceil(fps))
     roi_active = False
@@ -494,19 +493,11 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                             "footpoint": [float(footpoint[0]), float(footpoint[1])],
                             "inside": inside,
                             "confidence": float(conf) if conf is not None else None,
+                            "frame": frame,
+                            "lane_mask": lane_mask,
+                            "roi_polygon": list(active_polygon) if roi_active else [],
                         }
                     )
-
-                    if inside and roi_active:
-                        quality = _bbox_quality((float(x1), float(y1), float(x2), float(y2)), conf)
-                        prev = best_snapshots.get(track_id_int)
-                        if not prev or quality > prev.get("quality", 0):
-                            best_snapshots[track_id_int] = {
-                                "frame": frame.copy(),
-                                "mask": lane_mask.copy() if lane_mask is not None else None,
-                                "bbox": (float(x1), float(y1), float(x2), float(y2)),
-                                "quality": quality,
-                            }
 
             new_events = accumulator.update(frame_idx, track_entries, roi_active=roi_active)
             completed_start = len(accumulator.completed) - len(new_events)
@@ -516,16 +507,25 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 print(
                     f"Completed event: track {event.track_id} | frames {event.start_frame}-{event.end_frame} | duration {duration}"
                 )
-                best = best_snapshots.pop(event.track_id, None)
-                if best:
-                    snapshot = best["frame"].copy()
-                    _overlay_lane_mask(snapshot, best.get("mask"))
-                    bx1, by1, bx2, by2 = map(int, best["bbox"])
-                    cv2.rectangle(snapshot, (bx1, by1), (bx2, by2), (0, 0, 255), 3)
+                best_snapshot = event.best_snapshot_data or {}
+                snapshot_frame = best_snapshot.get("frame") if isinstance(best_snapshot, dict) else None
+                if snapshot_frame is not None:
+                    snapshot = snapshot_frame.copy()
+                    _overlay_lane_mask(snapshot, best_snapshot.get("lane_mask"))
+                    track_record = best_snapshot.get("track_record") if isinstance(best_snapshot, dict) else None
+                    roi_polygon = best_snapshot.get("roi_polygon") if isinstance(best_snapshot, dict) else None
+                    if track_record:
+                        draw_overlays(
+                            snapshot,
+                            roi_polygon,
+                            [track_record],
+                            show_tracks,
+                            show_footpoints,
+                        )
                     cv2.putText(
                         snapshot,
                         f"Event {event_id} | Track {event.track_id}",
-                        (max(5, bx1), max(20, by1 - 10)),
+                        (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.8,
                         (0, 0, 255),
