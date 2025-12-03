@@ -41,6 +41,7 @@ class ROIManager:
         stability_ratio: float = 0.25,
         good_streak_thresh: int = 1,
         bad_streak_tolerance: int = 5,
+        min_centroid_x_ratio: float = 0.45,
     ) -> None:
         self.roi_path = Path(roi_path) if roi_path is not None else None
         self.min_area_ratio = min_area_ratio
@@ -49,6 +50,7 @@ class ROIManager:
         self.stability_ratio = stability_ratio
         self.good_streak_thresh = int(good_streak_thresh)
         self.bad_streak_tolerance = int(bad_streak_tolerance)
+        self.min_centroid_x_ratio = min_centroid_x_ratio
 
         self._config: Optional[ROIConfig] = None
         self._scaled_polygon: Optional[List[Point]] = None
@@ -155,10 +157,31 @@ class ROIManager:
             polygon = self._mask_to_polygon(mask)
 
         if polygon:
-            self.is_active = True
-            self._dynamic_polygon = polygon
-            reason = "raw_pass"
-            valid = True
+            centroid = self._centroid(polygon)
+            if centroid is None:
+                self.is_active = False
+                self._dynamic_polygon = []
+                reason = "invalid_centroid"
+                valid = False
+            else:
+                cx, _ = centroid
+                if cx < width * self.min_centroid_x_ratio:
+                    self.is_active = False
+                    self._dynamic_polygon = []
+                    reason = "centroid_left_side"
+                    valid = False
+                else:
+                    polygon_area = float(cv2.contourArea(np.array(polygon, dtype=np.float32)))
+                    if polygon_area < width * height * self.min_area_ratio:
+                        self.is_active = False
+                        self._dynamic_polygon = []
+                        reason = "area_too_small"
+                        valid = False
+                    else:
+                        self.is_active = True
+                        self._dynamic_polygon = polygon
+                        reason = "filters_passed"
+                        valid = True
         else:
             self.is_active = False
             self._dynamic_polygon = []
