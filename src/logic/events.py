@@ -19,6 +19,7 @@ class OccupancyEvent:
     start_frame: int
     end_frame: int
     frames: List[FrameOccupancy] = field(default_factory=list)
+    best_snapshot_data: Optional[Dict[str, object]] = None
 
     @property
     def duration_frames(self) -> int:
@@ -33,6 +34,8 @@ class _TrackState:
     start_frame: Optional[int] = None
     last_inside_frame: Optional[int] = None
     frames: List[FrameOccupancy] = field(default_factory=list)
+    max_box_area: float = 0.0
+    best_snapshot_data: Optional[Dict[str, object]] = None
 
     def reset(self) -> None:
         self.inside_streak = 0
@@ -41,6 +44,8 @@ class _TrackState:
         self.start_frame = None
         self.last_inside_frame = None
         self.frames = []
+        self.max_box_area = 0.0
+        self.best_snapshot_data = None
 
 
 class EventAccumulator:
@@ -75,6 +80,8 @@ class EventAccumulator:
             if inside:
                 state.inside_streak += 1
                 state.outside_streak = 0
+                x1, y1, x2, y2 = bbox
+                current_area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
                 frame_event = FrameOccupancy(
                     frame_idx=frame_idx,
                     footpoint=(float(footpoint[0]), float(footpoint[1])),
@@ -88,6 +95,23 @@ class EventAccumulator:
                 )
                 state.frames.append(frame_event)
                 state.last_inside_frame = frame_idx
+
+                if current_area > state.max_box_area:
+                    snapshot_frame = record.get("frame")
+                    if snapshot_frame is not None:
+                        state.max_box_area = current_area
+                        state.best_snapshot_data = {
+                            "frame": snapshot_frame.copy(),
+                            "lane_mask": record.get("lane_mask").copy()
+                            if record.get("lane_mask") is not None
+                            else None,
+                            "roi_polygon": list(record.get("roi_polygon") or []),
+                            "track_record": {
+                                k: v
+                                for k, v in record.items()
+                                if k not in {"frame", "lane_mask", "roi_polygon"}
+                            },
+                        }
 
                 if not state.active and state.inside_streak >= self.min_frames_in:
                     start_index = max(len(state.frames) - self.min_frames_in, 0)
@@ -154,6 +178,7 @@ class EventAccumulator:
             start_frame=start_frame,
             end_frame=end_frame,
             frames=list(state.frames),
+            best_snapshot_data=state.best_snapshot_data,
         )
         self._states[track_id] = _TrackState()
         return event
