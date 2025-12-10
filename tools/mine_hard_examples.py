@@ -1,9 +1,20 @@
 """Mine hard examples for emergency lane segmentation using YOLOv8-seg."""
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# --- 【新增代码开始】 ---
+# 强制将项目根目录加入 Python 搜索路径
+# 获取当前脚本的绝对路径 -> 找到父级(tools) -> 再找父级(project1)
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[1]  # project root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add root to PATH
+# --- 【新增代码结束】 ---
+
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -11,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from ultralytics import YOLO
 
+# 现在这一行就能正常运行了，因为 ROOT 已经在 path 里了
 from src.utils.config import load_config, resolve_path
 from src.utils.paths import PROJECT_ROOT, project_path
 
