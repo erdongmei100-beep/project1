@@ -134,12 +134,21 @@ def _save_frame(
     save_path: Path,
     reason: str,
 ) -> None:
+    save_dir = save_path.parent
+    stem = save_path.stem
+    suffix = save_path.suffix or ".jpg"
+
+    raw_path = save_dir / f"{stem}_raw{suffix}"
+    vis_path = save_dir / f"{stem}_vis{suffix}"
+
+    cv2.imwrite(str(raw_path), frame)
+
     canvas = frame.copy()
     if mask is not None:
         contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(canvas, contours, -1, (0, 255, 255), 2)
     cv2.putText(canvas, reason, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    cv2.imwrite(str(save_path), canvas)
+    cv2.imwrite(str(vis_path), canvas)
 
 
 def _status_color(status: str) -> str:
