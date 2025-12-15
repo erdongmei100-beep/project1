@@ -22,6 +22,7 @@ from src.render.overlay import draw_overlays
 from src.utils.config import load_config, resolve_path
 from src.utils.geometry import point_in_polygon
 from src.utils.paths import PROJECT_ROOT, project_path
+from src.lpr.enrich import enrich_events_csv_with_lpr
 
 
 DEFAULT_CONFIG_REL = project_path("configs", "default.yaml").relative_to(PROJECT_ROOT)
@@ -61,6 +62,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--diagnose",
         action="store_true",
         help="Enable diagnostic logging and failure snapshots for ROI debugging.",
+    )
+    parser.add_argument(
+        "--lpr",
+        action="store_true",
+        help="Enable license plate recognition post-processing regardless of config.",
     )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
@@ -161,25 +167,70 @@ def _lane_metrics(mask: Optional[np.ndarray], frame_size: Tuple[int, int]) -> Tu
     return area_ratio, float(cx / width) if width > 0 else None
 
 
+def _save_best_snapshot(
+    event: OccupancyEvent,
+    event_id: int,
+    snapshot_dir: Path,
+    show_tracks: bool,
+    show_footpoints: bool,
+) -> Optional[Path]:
+    best_snapshot = event.best_snapshot_data or {}
+    snapshot_frame = best_snapshot.get("frame") if isinstance(best_snapshot, dict) else None
+    if snapshot_frame is None:
+        return None
+
+    snapshot = snapshot_frame.copy()
+    _overlay_lane_mask(snapshot, best_snapshot.get("lane_mask"))
+    track_record = best_snapshot.get("track_record") if isinstance(best_snapshot, dict) else None
+    roi_polygon = best_snapshot.get("roi_polygon") if isinstance(best_snapshot, dict) else None
+    if track_record:
+        draw_overlays(
+            snapshot,
+            roi_polygon,
+            [track_record],
+            show_tracks,
+            show_footpoints,
+        )
+    cv2.putText(
+        snapshot,
+        f"Event {event_id} | Track {event.track_id}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 0, 255),
+        2,
+    )
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = snapshot_dir / f"event_{event_id:03d}.jpg"
+    success = cv2.imwrite(str(snap_path), snapshot)
+    if success and snap_path.exists():
+        event.best_frame_path = str(snap_path)
+        return snap_path
+    return None
+
+
 def export_events(events, output_csv: Path, fps: float) -> None:
     if not events:
         print("No occupancy events detected; skipping CSV export.")
         return
     rows = []
-    for event in events:
+    for idx, event in enumerate(events, start=1):
         start_time = event.start_frame / fps if fps else None
         end_time = event.end_frame / fps if fps else None
         row: Dict[str, object] = {
+            "event_id": idx,
             "track_id": event.track_id,
             "start_frame": event.start_frame,
             "end_frame": event.end_frame,
             "duration_frames": event.duration_frames,
             "start_time_s": start_time,
             "end_time_s": end_time,
+            "best_frame_path": event.best_frame_path or "",
+            "plate_crop_path": event.plate_crop_path or "",
         }
         rows.append(row)
     df = pd.DataFrame(rows)
-    df.to_csv(output_csv, index=False)
+    df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"Saved CSV to {output_csv}")
 
 
@@ -317,6 +368,8 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     tracking_cfg = dict(config.get("tracking", {}) or {})
     tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
     tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
+    lpr_cfg = dict(config.get("license_plate_recognition") or {})
+    lpr_enabled = bool(lpr_cfg.get("enable")) or args.lpr
 
     roi_cfg = config.get("roi", {}) or {}
     dynamic_seg_cfg = dict(roi_cfg.get("dynamic_seg") or {})
@@ -507,32 +560,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 print(
                     f"Completed event: track {event.track_id} | frames {event.start_frame}-{event.end_frame} | duration {duration}"
                 )
-                best_snapshot = event.best_snapshot_data or {}
-                snapshot_frame = best_snapshot.get("frame") if isinstance(best_snapshot, dict) else None
-                if snapshot_frame is not None:
-                    snapshot = snapshot_frame.copy()
-                    _overlay_lane_mask(snapshot, best_snapshot.get("lane_mask"))
-                    track_record = best_snapshot.get("track_record") if isinstance(best_snapshot, dict) else None
-                    roi_polygon = best_snapshot.get("roi_polygon") if isinstance(best_snapshot, dict) else None
-                    if track_record:
-                        draw_overlays(
-                            snapshot,
-                            roi_polygon,
-                            [track_record],
-                            show_tracks,
-                            show_footpoints,
-                        )
-                    cv2.putText(
-                        snapshot,
-                        f"Event {event_id} | Track {event.track_id}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 255),
-                        2,
-                    )
-                    snap_path = snapshot_dir / f"event_{event_id:03d}.jpg"
-                    cv2.imwrite(str(snap_path), snapshot)
+                snap_path = _save_best_snapshot(event, event_id, snapshot_dir, show_tracks, show_footpoints)
 
             if args.diagnose:
                 debug_rows.append(
@@ -595,6 +623,11 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
 
     accumulator.flush()
     events = list(accumulator.completed)
+    if events:
+        for idx, event in enumerate(events, start=1):
+            if event.best_frame_path and Path(event.best_frame_path).exists():
+                continue
+            _save_best_snapshot(event, idx, snapshot_dir, show_tracks, show_footpoints)
     if args.diagnose and debug_rows:
         debug_df = pd.DataFrame(debug_rows)
         debug_df.to_csv(debug_log_path, index=False)
@@ -633,8 +666,19 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
         except Exception as exc:  # pragma: no cover - best effort plotting
             print(f"Skipping diagnostic plots due to error: {exc}")
 
-    if args.save_csv:
+    if args.save_csv or lpr_enabled:
         export_events(events, csv_output_path, fps)
+
+    if lpr_enabled:
+        if not csv_output_path.exists():
+            print(f"LPR enabled but base CSV not found at {csv_output_path}; skipping LPR enrichment.")
+        else:
+            output_csv_cfg = lpr_cfg.get("output_csv", "auto")
+            if not output_csv_cfg or str(output_csv_cfg).lower() == "auto":
+                lpr_output_csv = csv_output_path.with_name("events_with_plate.csv")
+            else:
+                lpr_output_csv = resolve_path(PROJECT_ROOT, str(output_csv_cfg))
+            enrich_events_csv_with_lpr(str(csv_output_path), str(lpr_output_csv), lpr_cfg)
 
     if args.clip:
         export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)

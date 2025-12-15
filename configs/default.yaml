@@ -60,3 +60,17 @@ outputs:
   clip_dir: clips
   clip_pre_seconds: 1.0
   clip_post_seconds: 1.0
+
+license_plate_recognition:
+  enable: false
+  backend: onnxruntime-gpu   # or onnxruntime
+  model_dir: ""
+  input_field: plate_crop_path
+  fallback_field: best_frame_path
+  output_csv: auto           # auto => events_with_plate.csv
+  write_encoding: utf-8-sig
+  quality_filter:
+    enable: true
+    blur_var_threshold: 60
+    format_check: true
+  progress_interval: 50
