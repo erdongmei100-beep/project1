@@ -65,8 +65,7 @@ license_plate_recognition:
   enable: true
   backend: onnxruntime-gpu   # or onnxruntime
   model_dir: ""
-  input_field: plate_crop_path
-  fallback_field: best_frame_path
+  input_field: best_frame_path   # 如果实际列名为 best_frame 可改成对应列
   output_csv: auto           # auto => events_with_plate.csv
   write_encoding: utf-8-sig
   quality_filter:

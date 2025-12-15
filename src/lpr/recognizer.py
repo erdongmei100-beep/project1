@@ -39,6 +39,21 @@ class LPRResult:
     status: str
 
 
+def _read_image(path: Path) -> Optional[np.ndarray]:
+    """Robustly read an image from disk, including Windows paths."""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+        if data.size == 0:
+            return None
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if image is None:
+            image = cv2.imread(str(path))
+        return image
+    except Exception as exc:  # pragma: no cover - defensive path handling
+        logger.error("Failed to read image %s: %s", path, exc)
+        return None
+
+
 class HyperLPR3Recognizer:
     def __init__(
         self,
@@ -79,18 +94,11 @@ class HyperLPR3Recognizer:
 
     def recognize(self, image_path: str) -> LPRResult:
         path = Path(image_path)
-        if not path.exists():
-            return LPRResult("", 0.0, None, "missing_file")
 
         if not self._available or self._catcher is None:
             return LPRResult("", 0.0, None, "fail")
 
-        try:
-            image = cv2.imread(str(path))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error("Failed to read image %s: %s", path, exc)
-            return LPRResult("", 0.0, None, "fail")
-
+        image = _read_image(path)
         if image is None:
             return LPRResult("", 0.0, None, "fail")
 
@@ -120,7 +128,7 @@ class HyperLPR3Recognizer:
             blur_score = calculate_blur_score(crop)
             if blur_score < self.blur_threshold:
                 logger.warning("Blur score %.2f below threshold %.2f for %s", blur_score, self.blur_threshold, path)
-                return LPRResult("", 0.0, bbox, "bad_quality")
+                return LPRResult("", 0.0, bbox, "fail")
 
             province_width = max(1, int(crop.shape[1] * 0.2))
             province_crop = crop[:, :province_width]
@@ -129,6 +137,6 @@ class HyperLPR3Recognizer:
                 logger.warning(
                     "Province blur score %.2f below threshold %.2f for %s", province_score, self.blur_threshold, path
                 )
-                return LPRResult("", 0.0, bbox, "bad_quality")
+                return LPRResult("", 0.0, bbox, "fail")
 
         return LPRResult(plate_text, plate_score, bbox, "ok")

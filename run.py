@@ -678,7 +678,10 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
                 lpr_output_csv = csv_output_path.with_name("events_with_plate.csv")
             else:
                 lpr_output_csv = resolve_path(PROJECT_ROOT, str(output_csv_cfg))
-            enrich_events_csv_with_lpr(str(csv_output_path), str(lpr_output_csv), lpr_cfg)
+            enriched_path = enrich_events_csv_with_lpr(
+                str(csv_output_path), str(lpr_output_csv), lpr_cfg
+            )
+            print(f"Saved LPR-enriched CSV to {enriched_path}")
 
     if args.clip:
         export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
