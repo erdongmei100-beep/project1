@@ -20,6 +20,8 @@ class OccupancyEvent:
     end_frame: int
     frames: List[FrameOccupancy] = field(default_factory=list)
     best_snapshot_data: Optional[Dict[str, object]] = None
+    best_frame_path: Optional[str] = None
+    plate_crop_path: Optional[str] = None
 
     @property
     def duration_frames(self) -> int:

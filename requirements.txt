@@ -5,3 +5,5 @@ pandas
 opencv-python
 ultralytics
 streamlit
+hyperlpr3
+onnxruntime-gpu
