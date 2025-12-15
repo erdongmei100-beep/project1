@@ -1,0 +1,53 @@
+项目目录与逻辑简介
+==================
+
+目录结构与作用
+--------------
+- README.md：项目概述与使用说明。
+- requirements.txt：Python 依赖列表。
+- configs/
+  - default.yaml：默认运行配置（模型、ROI、输出开关等）。
+  - tracker/*.yaml：跟踪器相关阈值与参数。
+- data/
+  - videos/：示例或待处理的视频输入。
+  - rois/：视频对应的 ROI 多边形 JSON。
+  - outputs/：运行后导出的可视化视频、CSV 与事件剪辑。
+- logs/：运行过程的日志与诊断输出。
+- weights/ 与根目录下 yolov8n.pt、yolov8n-seg.pt 等：检测/分割模型权重。
+- src/
+  - dettrack/：基于 YOLO 的检测与 ByteTrack 风格跟踪封装（DetectorTracker 等）。
+  - io/：视频探测与元数据工具（probe_video 等）。
+  - logic/：事件累计与占道判定（EventAccumulator、OccupancyEvent 等）。
+  - render/：可视化叠加（draw_overlays 等）。
+  - roi/：ROI 管理与自动/交互生成（ROIManager 等）。
+  - utils/：配置加载、路径与几何辅助方法。
+- run.py：命令行入口，执行完整占用检测流程。
+- app.py：可选的应用入口/集成示例。
+- tools/、tests/：辅助脚本与测试。
+
+运行核心逻辑概览（基于 run.py）
+------------------------------
+1. 参数解析：读取视频源、配置路径、输出开关（保存视频/CSV/剪辑）及诊断选项等。
+2. 配置与模型准备：
+   - load_config 载入 YAML 配置，resolve_path 解析相对路径。
+   - prepare_tracker 按配置创建 DetectorTracker，内部加载 YOLO 权重并设置置信度、IoU、最大检测数等。
+   - ROIManager 处理 ROI：优先用提供的 ROI 文件，必要时尝试自动车道分割或交互生成。
+3. 视频元信息：probe_video 获取帧率、帧数与尺寸，为后续时间戳/剪辑计算提供基础。
+4. 主推理循环：
+   - 逐帧读取视频并通过 DetectorTracker 获取检测 + 跟踪 ID。
+   - ROIManager 基于车道分割或既有多边形生成 ROI Mask。
+   - 判断每个目标中心点是否落在 ROI 内（point_in_polygon/_point_in_mask）。
+   - EventAccumulator 按连续帧阈值统计占道事件，记录 track_id、起止帧、持续时间等。
+   - 可选：draw_overlays 将检测框、轨迹、ROI 等叠加到画面；_overlay_lane_mask 可视化车道掩码。
+5. 输出阶段：
+   - export_events 将事件写入 CSV，包含起止帧、持续帧数及秒级时间戳。
+   - 若启用 --save-video，输出带叠加的标注视频；若启用 --clip，按事件切分并导出带前后缓冲的视频片段。
+6. 诊断与指标：
+   - _lane_metrics 计算车道掩码面积占比及中心位置；
+   - _bbox_quality 等辅助函数用于调试输出质量。
+
+合并项目提示
+------------
+- 若从车牌识别项目接入，可直接消费 data/outputs 下的事件 CSV 与剪辑；track_id/时间戳可作为后续识别的索引。
+- 保持 ROI/配置路径一致，确保 DetectorTracker 使用的权重与车道分割模型路径在两个项目中统一。
+- 需要联动写入新的 CSV 时，可复用 export_events 的格式，或在 EventAccumulator 基础上添加车牌字段扩展。
