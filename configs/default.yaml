@@ -62,7 +62,7 @@ outputs:
   clip_post_seconds: 1.0
 
 license_plate_recognition:
-  enable: false
+  enable: true
   backend: onnxruntime-gpu   # or onnxruntime
   model_dir: ""
   input_field: plate_crop_path
