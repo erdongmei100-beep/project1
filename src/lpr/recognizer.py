@@ -4,7 +4,7 @@ import importlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -80,8 +80,6 @@ class HyperLPR3Recognizer:
         lpr3 = importlib.import_module("hyperlpr3")  # type: ignore
 
         kwargs: Dict[str, Any] = {"detect_level": getattr(lpr3, "DETECT_LEVEL_LOW", 0)}
-        if self.backend:
-            kwargs["backend_name"] = self.backend
         if self.model_dir:
             kwargs["model_path"] = str(self.model_dir)
         try:
@@ -92,20 +90,24 @@ class HyperLPR3Recognizer:
             self._catcher = None
             self._available = False
 
-    def recognize(self, image_path: str) -> LPRResult:
-        path = Path(image_path)
-
+    def recognize(self, image: Union[str, np.ndarray]) -> LPRResult:
+        path = Path(image) if isinstance(image, str) else None
         if not self._available or self._catcher is None:
             return LPRResult("", 0.0, None, "fail")
 
-        image = _read_image(path)
-        if image is None:
+        image_data: Optional[np.ndarray]
+        if isinstance(image, str):
+            image_data = _read_image(path) if path is not None else None
+        else:
+            image_data = image
+
+        if image_data is None:
             return LPRResult("", 0.0, None, "fail")
 
         try:
-            results = self._catcher(image)
+            results = self._catcher(image_data)
         except Exception as exc:  # pragma: no cover - defensive
-            logger.error("HyperLPR inference error on %s: %s", path, exc)
+            logger.error("HyperLPR inference error on %s: %s", path or "<array>", exc)
             return LPRResult("", 0.0, None, "fail")
 
         if not results:
