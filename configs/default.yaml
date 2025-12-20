@@ -33,7 +33,7 @@ roi:
 
     # 2. 位置过滤：防止副驾视角偏差
     # 如果报错 centroid_out_of_position 太多，就把这个由 0.7 改小到 0.5
-    min_centroid_x_ratio: 0.4
+    min_centroid_x_ratio: 0.5
     max_centroid_y_ratio: 0.98
 
     # 3. 稳定性过滤：防抖动
