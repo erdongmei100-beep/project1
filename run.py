@@ -401,6 +401,7 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
     roi_manager = ROIManager(
         min_area_ratio=float(filters_cfg.get("min_area_ratio", 0.005)),
         max_area_ratio=float(filters_cfg.get("max_area_ratio", 0.4)),
+        min_centroid_x_ratio=float(filters_cfg.get("min_centroid_x_ratio", 0.5)),
         expected_centroid=(
             float(filters_cfg.get("min_centroid_x_ratio", 0.55)),
             float(
