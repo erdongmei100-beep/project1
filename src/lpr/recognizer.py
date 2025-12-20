@@ -80,8 +80,6 @@ class HyperLPR3Recognizer:
         lpr3 = importlib.import_module("hyperlpr3")  # type: ignore
 
         kwargs: Dict[str, Any] = {"detect_level": getattr(lpr3, "DETECT_LEVEL_LOW", 0)}
-        if self.backend:
-            kwargs["backend_name"] = self.backend
         if self.model_dir:
             kwargs["model_path"] = str(self.model_dir)
         try:

@@ -670,7 +670,9 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
         export_events(events, csv_output_path, fps)
 
     if lpr_enabled:
-        if not csv_output_path.exists():
+        if not events:
+            print(f"LPR enabled but no events detected for {source_path.name}; skipping LPR enrichment.")
+        elif not csv_output_path.exists():
             print(f"LPR enabled but base CSV not found at {csv_output_path}; skipping LPR enrichment.")
         else:
             output_csv_cfg = lpr_cfg.get("output_csv", "auto")
