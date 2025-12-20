@@ -103,6 +103,41 @@ def _process_single_row(row: Dict) -> Dict[str, object]:
         return {"plate_text": "", "plate_score": 0.0, "plate_bbox": "", "lpr_status": "fail"}
 
 
+def _load_image(path: Path) -> Optional[np.ndarray]:
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        image = cv2.imread(str(path))
+    return image
+
+
+def _parse_bbox(raw: str) -> Optional[Tuple[int, int, int, int]]:
+    if not raw:
+        return None
+    try:
+        parts = [float(p) for p in raw.split(",")]
+        if len(parts) < 4:
+            return None
+        x1, y1, x2, y2 = parts[:4]
+        return int(x1), int(y1), int(x2), int(y2)
+    except ValueError:
+        return None
+
+
+def _crop_with_margin(image: np.ndarray, bbox: Tuple[int, int, int, int], margin: int = 15) -> Optional[np.ndarray]:
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, x1 - margin)
+    y1 = max(0, y1 - margin)
+    x2 = min(w, x2 + margin)
+    y2 = min(h, y2 + margin)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return image[y1:y2, x1:x2]
+
+
 def _determine_input_field(df: pd.DataFrame, configured_field: str | None) -> str:
     if configured_field and configured_field in df.columns:
         return configured_field
