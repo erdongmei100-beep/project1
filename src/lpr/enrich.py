@@ -3,13 +3,50 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
+import cv2
+import numpy as np
 import pandas as pd
 
-from .recognizer import HyperLPR3Recognizer
+from .recognizer import HyperLPR3Recognizer, LPRResult
 
 logger = logging.getLogger(__name__)
+
+
+def _load_image(path: Path) -> Optional[np.ndarray]:
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        image = cv2.imread(str(path))
+    return image
+
+
+def _parse_bbox(raw: str) -> Optional[Tuple[int, int, int, int]]:
+    if not raw:
+        return None
+    try:
+        parts = [float(p) for p in raw.split(",")]
+        if len(parts) < 4:
+            return None
+        x1, y1, x2, y2 = parts[:4]
+        return int(x1), int(y1), int(x2), int(y2)
+    except ValueError:
+        return None
+
+
+def _crop_with_margin(image: np.ndarray, bbox: Tuple[int, int, int, int], margin: int = 15) -> Optional[np.ndarray]:
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, x1 - margin)
+    y1 = max(0, y1 - margin)
+    x2 = min(w, x2 + margin)
+    y2 = min(h, y2 + margin)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return image[y1:y2, x1:x2]
 
 
 def _determine_input_field(df: pd.DataFrame, configured_field: str | None) -> str:
@@ -32,6 +69,8 @@ def enrich_events_csv_with_lpr(input_csv: str, output_csv: str | None, cfg: Dict
     input_field = lpr_cfg.get("input_field") or None
     encoding = lpr_cfg.get("write_encoding", "utf-8-sig")
     progress_interval = int(lpr_cfg.get("progress_interval", 50) or 0)
+    crop_margin = int(lpr_cfg.get("crop_margin", 15) or 0)
+    bbox_column = lpr_cfg.get("bbox_field", "best_bbox")
 
     recognizer = HyperLPR3Recognizer(
         backend=lpr_cfg.get("backend", "onnxruntime-gpu"),
@@ -54,6 +93,8 @@ def enrich_events_csv_with_lpr(input_csv: str, output_csv: str | None, cfg: Dict
         raw_value = row.get(input_field, "")
         image_value = "" if pd.isna(raw_value) else str(raw_value).strip()
         image_path = Path(image_value) if image_value else None
+        bbox_value = "" if pd.isna(row.get(bbox_column, "")) else str(row.get(bbox_column, "")).strip()
+        parsed_bbox = _parse_bbox(bbox_value)
 
         if not image_value or image_path is None or not image_path.exists():
             status = "missing_file"
@@ -61,7 +102,14 @@ def enrich_events_csv_with_lpr(input_csv: str, output_csv: str | None, cfg: Dict
             plate_score = 0.0
             plate_bbox = ""
         else:
-            result = recognizer.recognize(str(image_path))
+            full_image = _load_image(image_path)
+            vehicle_image = _crop_with_margin(full_image, parsed_bbox, crop_margin) if full_image is not None else None
+            if vehicle_image is None:
+                vehicle_image = full_image
+            if vehicle_image is None:
+                result = LPRResult("", 0.0, None, "fail")
+            else:
+                result = recognizer.recognize(vehicle_image)
             plate_text = result.plate_text
             plate_score = result.plate_score
             plate_bbox = json.dumps(result.plate_bbox) if result.plate_bbox else ""

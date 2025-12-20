@@ -217,6 +217,12 @@ def export_events(events, output_csv: Path, fps: float) -> None:
     for idx, event in enumerate(events, start=1):
         start_time = event.start_frame / fps if fps else None
         end_time = event.end_frame / fps if fps else None
+        best_bbox_str = ""
+        snapshot_data = event.best_snapshot_data if isinstance(event.best_snapshot_data, dict) else {}
+        track_record = snapshot_data.get("track_record") if isinstance(snapshot_data, dict) else None
+        bbox = track_record.get("bbox") if isinstance(track_record, dict) else None
+        if bbox and len(bbox) >= 4:
+            best_bbox_str = ",".join(str(float(coord)) for coord in bbox[:4])
         row: Dict[str, object] = {
             "event_id": idx,
             "track_id": event.track_id,
@@ -227,6 +233,7 @@ def export_events(events, output_csv: Path, fps: float) -> None:
             "end_time_s": end_time,
             "best_frame_path": event.best_frame_path or "",
             "plate_crop_path": event.plate_crop_path or "",
+            "best_bbox": best_bbox_str,
         }
         rows.append(row)
     df = pd.DataFrame(rows)
@@ -670,7 +677,9 @@ def process_video(source_path: Path, base_config: Dict[str, object], args: argpa
         export_events(events, csv_output_path, fps)
 
     if lpr_enabled:
-        if not csv_output_path.exists():
+        if not events:
+            print(f"LPR enabled but no events detected for {source_path.name}; skipping LPR enrichment.")
+        elif not csv_output_path.exists():
             print(f"LPR enabled but base CSV not found at {csv_output_path}; skipping LPR enrichment.")
         else:
             output_csv_cfg = lpr_cfg.get("output_csv", "auto")
