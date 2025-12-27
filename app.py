@@ -1,14 +1,8 @@
-"""Streamlit review terminal for emergency lane violations.
-
-This app scans processed video tasks under ``data/outputs/`` and provides a
-human-in-the-loop workflow to review AI-detected license plates. Users can
-navigate events, correct plate values, mark reviews, and persist updates back to
-the source CSV files.
-"""
-
+"""Streamlit review terminal for emergency lane violations."""
 from __future__ import annotations
 
 import os
+import ast
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -16,219 +10,277 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-
+# ================= 配置区域 =================
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
 CSV_NAME = "events_with_plate.csv"
 SESSION_KEY = "review_tasks"
 
-# 核心字段映射配置
+# 核心字段映射
 COLS = {
     "img_path": "best_frame_path",
-    "plate_crop": "plate_crop",       # 程序内部统一使用 plate_crop
+    "plate_crop": "plate_crop",       
     "plate_text": "plate_text",
     "plate_score": "plate_score",
     "lpr_status": "lpr_status",
+    "bbox": "plate_bbox"             # 新增：读取坐标用于动态裁切
 }
 
+# ================= 样式注入 (CSS) =================
+# Streamlit 原生不支持按钮变蓝变绿，需要注入 CSS 魔法
+def inject_custom_css():
+    st.markdown("""
+        <style>
+        /* 状态标签样式 */
+        .status-badge-ok {
+            background-color: #d4edda;
+            color: #155724;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            border: 1px solid #c3e6cb;
+        }
+        .status-badge-fail {
+            background-color: #f8d7da;
+            color: #721c24;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            border: 1px solid #f5c6cb;
+        }
+        /* 复核状态指示器 */
+        .review-status-yes {
+            color: #28a745;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        .review-status-no {
+            color: #dc3545;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+# ================= 功能函数 =================
 
 def discover_tasks(outputs_dir: Path) -> List[Tuple[str, Path]]:
-    """Return list of (task_name, csv_path) where the csv exists under outputs."""
-
-    tasks: List[Tuple[str, Path]] = []
+    tasks = []
     if not outputs_dir.exists():
         return tasks
-
     for entry in sorted(outputs_dir.iterdir()):
-        if not entry.is_dir():
-            continue
+        if not entry.is_dir(): continue
         csv_path = entry / CSV_NAME
         if csv_path.is_file():
             tasks.append((entry.name, csv_path))
     return tasks
 
-
 def initialize_dataframe(csv_path: Path) -> pd.DataFrame:
-    """Load the CSV and ensure review helper columns exist."""
-
     df = pd.read_csv(csv_path)
-    # 1. 清理列名空格
     df.columns = df.columns.str.strip()
-
-    # 2. 字段兼容处理：如果 CSV 里是 plate_crop_path，重命名为 plate_crop 以匹配配置
+    
+    # 兼容处理
     if "plate_crop_path" in df.columns and COLS["plate_crop"] not in df.columns:
         df.rename(columns={"plate_crop_path": COLS["plate_crop"]}, inplace=True)
 
-    # Keep expected columns as strings where appropriate to avoid type surprises.
-    for col in [COLS["img_path"], COLS["plate_crop"], COLS["plate_text"], COLS["lpr_status"]]:
-        if col in df.columns:
-            df[col] = df[col].astype(str)
-
-    if COLS["plate_score"] in df.columns:
-        df[COLS["plate_score"]] = pd.to_numeric(df[COLS["plate_score"]], errors="coerce")
-
+    # 初始化辅助列
     if "reviewed" not in df.columns:
         df["reviewed"] = False
     else:
         df["reviewed"] = df["reviewed"].astype(bool).fillna(False)
 
     if "manual_plate" not in df.columns:
-        df["manual_plate"] = df.get(COLS["plate_text"], pd.Series(["" for _ in range(len(df))])).fillna("")
+        df["manual_plate"] = df.get(COLS["plate_text"], "").fillna("")
+    
+    # 初始化排除列 (Exclude)
+    if "is_excluded" not in df.columns:
+        df["is_excluded"] = False
     else:
-        df["manual_plate"] = df["manual_plate"].fillna(df.get(COLS["plate_text"], "")).fillna("")
+        df["is_excluded"] = df["is_excluded"].astype(bool).fillna(False)
 
     return df
 
-
-def set_active_task(task_name: str) -> None:
-    """Update session state with the currently selected task."""
-
-    st.session_state["active_task"] = task_name
-
-
-def ensure_task_loaded(task_name: str, csv_path: Path) -> None:
-    """Load task data into session state if missing."""
-
+def get_task_data(task_name: str, csv_path: Path) -> Dict:
     if SESSION_KEY not in st.session_state:
         st.session_state[SESSION_KEY] = {}
-
+    
     if task_name not in st.session_state[SESSION_KEY]:
         st.session_state[SESSION_KEY][task_name] = {
             "csv_path": csv_path,
             "df": initialize_dataframe(csv_path),
             "index": 0,
         }
-
-
-def get_task_data(task_name: str) -> Dict:
     return st.session_state[SESSION_KEY][task_name]
 
+def load_image_robust(path_str):
+    if not path_str or str(path_str).lower() == 'nan': return None
+    clean_path = str(path_str).strip().replace('"', '')
+    path_obj = Path(clean_path)
+    if path_obj.is_file():
+        try:
+            return Image.open(path_obj)
+        except:
+            return None
+    return None
 
-def clamp_index(idx: int, total: int) -> int:
-    if total == 0:
-        return 0
-    return max(0, min(idx, total - 1))
-
-
-def display_image(image_path: str | os.PathLike[str], caption: str) -> None:
-    """Render an image if possible; otherwise show a warning placeholder."""
-
-    if not image_path or str(image_path).lower() == 'nan':
-        st.warning(f"缺少图片：{caption}")
-        return
-
-    path_obj = Path(image_path)
-    
-    # 尝试处理 Windows 路径中可能存在的引号问题
-    if not path_obj.exists():
-        # 有时候路径可能包含多余的引号或空格
-        clean_path = str(image_path).strip().replace('"', '')
-        path_obj = Path(clean_path)
-
-    if not path_obj.is_file():
-        st.warning(f"未找到图片文件：{path_obj}")
-        return
-
+def crop_plate_dynamic(full_img, bbox_str):
+    """如果硬盘上没有特写图，就根据坐标现场切一个"""
     try:
-        image = Image.open(path_obj)
-    except Exception as exc:  # noqa: BLE001 - display error to user directly
-        st.warning(f"无法加载图片 {path_obj.name}: {exc}")
-        return
+        # bbox_str 格式通常是 "[x1, y1, x2, y2]"
+        bbox = ast.literal_eval(bbox_str)
+        if isinstance(bbox, list) and len(bbox) == 4:
+            # PIL crop 接受 (left, top, right, bottom)
+            # 注意：如果坐标是浮点数，需要转int
+            x1, y1, x2, y2 = map(int, bbox)
+            # 增加一点点padding防止切太紧
+            padding = 5
+            width, height = full_img.size
+            x1 = max(0, x1 - padding)
+            y1 = max(0, y1 - padding)
+            x2 = min(width, x2 + padding)
+            y2 = min(height, y2 + padding)
+            
+            return full_img.crop((x1, y1, x2, y2))
+    except Exception as e:
+        print(f"Cropping error: {e}")
+        return None
+    return None
 
-    st.image(image, use_container_width=True, caption=caption)
-
-
-def main() -> None:
-    st.set_page_config(page_title="应急车道违规复核终端", page_icon="🚧", layout="wide")
-    st.title("应急车道违规复核终端")
-    st.caption("查看模型检测结果，人工核查车牌并实时写回 CSV。")
+# ================= 主程序 =================
+def main():
+    st.set_page_config(page_title="违规复核终端", page_icon="🚓", layout="wide")
+    inject_custom_css() # 注入样式
+    st.title("🚓 应急车道违规复核终端")
 
     tasks = discover_tasks(OUTPUTS_DIR)
     if not tasks:
-        st.error("未在 data/outputs/ 中找到包含 events_with_plate.csv 的任务目录。")
+        st.error("未找到任务数据 (data/outputs)")
         st.stop()
 
-    task_names = [name for name, _ in tasks]
-    default_idx = 0
-    current_task = st.session_state.get("active_task")
-    if current_task in task_names:
-        default_idx = task_names.index(current_task)
-
-    selected_task = st.sidebar.selectbox("选择视频任务", task_names, index=default_idx)
-    set_active_task(selected_task)
-
+    # 侧边栏
+    task_names = [t[0] for t in tasks]
+    selected_task = st.sidebar.selectbox("选择任务", task_names)
     csv_path = dict(tasks)[selected_task]
-    ensure_task_loaded(selected_task, csv_path)
-    task_data = get_task_data(selected_task)
-
+    
+    # 加载数据
+    task_data = get_task_data(selected_task, csv_path)
     df = task_data["df"]
-    total_events = len(df)
-    current_index = clamp_index(task_data.get("index", 0), total_events)
-    task_data["index"] = current_index
+    
+    # 翻页逻辑
+    col_stat1, col_stat2, col_stat3 = st.columns(3)
+    idx = task_data["index"]
+    
+    # 顶部统计
+    reviewed_count = df["reviewed"].sum()
+    total = len(df)
+    col_stat1.metric("总事件", total)
+    col_stat2.metric("复核进度", f"{reviewed_count}/{total}")
+    
+    # 翻页按钮
+    c_prev, c_curr, c_next = st.columns([1, 2, 1])
+    with c_prev:
+        if st.button("⬅️ 上一条", key="btn_prev", use_container_width=True):
+            task_data["index"] = max(0, idx - 1)
+            st.rerun()
+    with c_next:
+        if st.button("下一条 ➡️", key="btn_next", use_container_width=True):
+            task_data["index"] = min(total - 1, idx + 1)
+            st.rerun()
 
-    if total_events == 0:
-        st.info("当前任务的 CSV 为空。")
+    # --- 核心内容区 ---
+    if total == 0:
+        st.info("数据为空")
         st.stop()
 
-    reviewed_count = int(df["reviewed"].sum()) if "reviewed" in df.columns else 0
-    avg_confidence = (
-        df[COLS["plate_score"]].mean()
-        if COLS["plate_score"] in df.columns and not df[COLS["plate_score"]].empty
-        else float("nan")
-    )
+    row = df.iloc[task_data["index"]]
+    
+    c_img, c_detail = st.columns([2, 1])
+    
+    # 1. 左侧大图
+    with c_img:
+        full_img = load_image_robust(row.get(COLS["img_path"]))
+        if full_img:
+            st.image(full_img, use_container_width=True, caption="占用画面 (Evidence)")
+        else:
+            st.warning("原始证据图丢失")
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    metric_col1.metric("总违规事件", f"{total_events}")
-    # 修改 1: AI 识别置信度保留两位小数
-    metric_col2.metric("AI 识别置信度", f"{avg_confidence:.2f}" if pd.notna(avg_confidence) else "N/A")
-    metric_col3.metric("复核进度", f"{reviewed_count}/{total_events}")
-
-    navigation_left, navigation_right = st.columns([1, 1])
-    with navigation_left:
-        if st.button("上一条", disabled=current_index <= 0):
-            task_data["index"] = clamp_index(current_index - 1, total_events)
-            st.rerun()
-
-    with navigation_right:
-        if st.button("下一条", disabled=current_index >= total_events - 1):
-            task_data["index"] = clamp_index(current_index + 1, total_events)
-            st.rerun()
-
-    current_row = df.iloc[task_data["index"]]
-
-    left_col, right_col = st.columns([2, 1])
-    with left_col:
-        # 修改 2: 标题从“违规证据帧”改为“占用画面”
-        display_image(current_row.get(COLS["img_path"], ""), caption="占用画面")
-
-    with right_col:
-        st.subheader("车牌区域")
-        display_image(current_row.get(COLS["plate_crop"], ""), caption="车牌截图")
-
-        st.markdown("**AI 识别结果**")
-        st.write(f"车牌号：{current_row.get(COLS['plate_text'], '未知')}")
+    # 2. 右侧详情与操作
+    with c_detail:
+        st.subheader("🔎 详情面板")
         
-        # 修改 3: 单条记录置信度也保留两位小数
-        if pd.notna(current_row.get(COLS["plate_score"])):
-            st.write(f"置信度：{float(current_row.get(COLS['plate_score'])):.2f}")
-            
-        st.write(f"状态：{current_row.get(COLS['lpr_status'], '未知')}")
+        # --- 动态车牌显示 ---
+        # 优先读硬盘上的小图，如果没有，就用大图切
+        crop_img = load_image_robust(row.get(COLS["plate_crop"]))
+        
+        if crop_img is None and full_img is not None and pd.notna(row.get(COLS["bbox"])):
+            # 现场裁切！
+            crop_img = crop_plate_dynamic(full_img, row[COLS["bbox"]])
+            caption_txt = "车牌截图 (动态裁切)"
+        else:
+            caption_txt = "车牌截图 (文件)"
 
-        manual_default = current_row.get("manual_plate") or current_row.get(COLS["plate_text"]) or ""
-        with st.form(key=f"review_form_{selected_task}_{task_data['index']}"):
-            manual_plate = st.text_input("人工校正车牌", value=str(manual_default))
-            reviewed_flag = st.checkbox("标记为已复核", value=bool(current_row.get("reviewed", False)))
-            save_clicked = st.form_submit_button("保存", type="primary")
+        if crop_img:
+            st.image(crop_img, width=250, caption=caption_txt)
+        else:
+            st.info("无法获取车牌图像")
 
-        if save_clicked:
-            df.at[task_data["index"], "manual_plate"] = manual_plate.strip()
-            df.at[task_data["index"], "reviewed"] = reviewed_flag
+        # --- 识别状态 ---
+        lpr_val = str(row.get(COLS["lpr_status"], "unknown"))
+        st.markdown("**车牌文本识别**")
+        if lpr_val.lower() == 'ok':
+            st.markdown('<span class="status-badge-ok">✅ 成功运行</span>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<span class="status-badge-fail">⚠️ {lpr_val}</span>', unsafe_allow_html=True)
+        
+        st.divider()
 
-            df.to_csv(task_data["csv_path"], index=False)
-            task_data["df"] = df
+        # --- 复核操作表单 ---
+        
+        # 显示当前的复核状态
+        is_reviewed = row.get("reviewed", False)
+        is_excluded = row.get("is_excluded", False)
+        
+        if is_excluded:
+            st.markdown("当前状态：<span style='color:blue;font-weight:bold'>🚫 已排除 (非违规)</span>", unsafe_allow_html=True)
+        elif is_reviewed:
+            st.markdown("当前状态：<span class='review-status-yes'>✅ 已复核</span>", unsafe_allow_html=True)
+        else:
+            st.markdown("当前状态：<span class='review-status-no'>🔴 未复核</span>", unsafe_allow_html=True)
 
-            st.toast("已保存并写回 CSV。")
+        manual_val = row.get("manual_plate", "")
+        # 如果是空的，默认填入 AI 识别的结果
+        if pd.isna(manual_val) or manual_val == "":
+            manual_val = row.get(COLS["plate_text"], "")
 
+        new_plate = st.text_input("人工校正车牌", value=str(manual_val))
+        
+        # --- 按钮区 (保存 & 排除) ---
+        # 使用列来横向排列按钮
+        b_col1, b_col2 = st.columns(2)
+        
+        with b_col1:
+            # 绿色按钮 (Primary)
+            if st.button("✅ 保存并通过", type="primary", use_container_width=True):
+                # 写入数据
+                df.at[task_data["index"], "manual_plate"] = new_plate
+                df.at[task_data["index"], "reviewed"] = True
+                df.at[task_data["index"], "is_excluded"] = False # 如果保存通过，就取消排除状态
+                # 存盘
+                df.to_csv(task_data["csv_path"], index=False)
+                task_data["df"] = df
+                st.toast("✅ 已保存为【已复核】")
+                st.rerun()
+
+        with b_col2:
+            # 普通按钮 (代表蓝色/排除)
+            if st.button("🚫 排除此记录", use_container_width=True):
+                df.at[task_data["index"], "is_excluded"] = True
+                df.at[task_data["index"], "reviewed"] = True # 排除也算复核过的一种
+                # 存盘
+                df.to_csv(task_data["csv_path"], index=False)
+                task_data["df"] = df
+                st.toast("🚫 已标记为【排除】")
+                st.rerun()
 
 if __name__ == "__main__":
     main()
