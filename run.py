@@ -1,720 +1,286 @@
-"""Emergency lane occupancy detection MVP runner."""
+"""Streamlit review terminal for emergency lane violations."""
 from __future__ import annotations
 
-import argparse
-import copy
-import math
-from collections import Counter
+import os
+import ast
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-import cv2
-import numpy as np
 import pandas as pd
-from ultralytics import YOLO
-import torch
+import streamlit as st
+from PIL import Image
 
-from src.dettrack.pipeline import DetectorTracker
-from src.io.video import VideoMetadata, probe_video
-from src.logic.events import EventAccumulator, FrameOccupancy, OccupancyEvent
-from src.roi.manager import ROIManager
-from src.render.overlay import draw_overlays
-from src.utils.config import load_config, resolve_path
-from src.utils.geometry import point_in_polygon
-from src.utils.paths import PROJECT_ROOT, project_path
-from src.lpr.enrich import enrich_events_csv_with_lpr
+# ================= 配置区域 =================
+PROJECT_ROOT = Path(__file__).resolve().parent
+OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
+CSV_NAME = "events_with_plate.csv"
+SESSION_KEY = "review_tasks"
 
+# 核心字段映射
+COLS = {
+    "img_path": "best_frame_path",
+    "plate_crop": "plate_crop",       
+    "plate_text": "plate_text",
+    "plate_score": "plate_score",
+    "lpr_status": "lpr_status",
+    "bbox": "plate_bbox"             # 新增：读取坐标用于动态裁切
+}
 
-DEFAULT_CONFIG_REL = project_path("configs", "default.yaml").relative_to(PROJECT_ROOT)
-DEFAULT_TRACKER_CFG_REL = project_path("configs", "tracker", "bytetrack.yaml").relative_to(PROJECT_ROOT)
-DEFAULT_LANE_WEIGHTS_REL = project_path("weights", "lane_seg.pt").relative_to(PROJECT_ROOT)
+# ================= 样式注入 (CSS) =================
+# Streamlit 原生不支持按钮变蓝变绿，需要注入 CSS 魔法
+def inject_custom_css():
+    st.markdown("""
+        <style>
+        /* 状态标签样式 */
+        .status-badge-ok {
+            background-color: #d4edda;
+            color: #155724;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            border: 1px solid #c3e6cb;
+        }
+        .status-badge-fail {
+            background-color: #f8d7da;
+            color: #721c24;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            border: 1px solid #f5c6cb;
+        }
+        /* 复核状态指示器 */
+        .review-status-yes {
+            color: #28a745;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        .review-status-no {
+            color: #dc3545;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
+# ================= 功能函数 =================
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Emergency lane occupancy detection MVP")
-    parser.add_argument("--source", required=True, help="Path to input video or directory of videos")
-    parser.add_argument(
-        "--config",
-        default=str(DEFAULT_CONFIG_REL),
-        help="Path to YAML configuration file",
-    )
-    parser.add_argument(
-        "--save-video",
-        action="store_true",
-        help="Save annotated video to outputs directory",
-    )
-    parser.add_argument(
-        "--save-csv",
-        action="store_true",
-        help="Save occupancy events as CSV",
-    )
-    parser.add_argument(
-        "--lane-weights",
-        default=str(DEFAULT_LANE_WEIGHTS_REL),
-        help="Path to emergency lane segmentation weights.",
-    )
-    parser.add_argument(
-        "--clip",
-        action="store_true",
-        help="Export per-event video clips with buffered context.",
-    )
-    parser.add_argument(
-        "--diagnose",
-        action="store_true",
-        help="Enable diagnostic logging and failure snapshots for ROI debugging.",
-    )
-    parser.add_argument(
-        "--lpr",
-        action="store_true",
-        help="Enable license plate recognition post-processing regardless of config.",
-    )
-    args, unknown = parser.parse_known_args(argv)
-    if unknown:
-        joined = " ".join(unknown)
-        print(f"Warning: Ignoring unknown arguments: {joined}")
-    return args
+def discover_tasks(outputs_dir: Path) -> List[Tuple[str, Path]]:
+    tasks = []
+    if not outputs_dir.exists():
+        return tasks
+    for entry in sorted(outputs_dir.iterdir()):
+        if not entry.is_dir(): continue
+        csv_path = entry / CSV_NAME
+        if csv_path.is_file():
+            tasks.append((entry.name, csv_path))
+    return tasks
 
+def initialize_dataframe(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
+    
+    # 兼容处理
+    if "plate_crop_path" in df.columns and COLS["plate_crop"] not in df.columns:
+        df.rename(columns={"plate_crop_path": COLS["plate_crop"]}, inplace=True)
 
-def prepare_tracker(config: Dict[str, object], tracker_cfg_path: Path) -> DetectorTracker:
-    model_cfg = config.get("model", {})
-    tracking_cfg = config.get("tracking", {})
-    return DetectorTracker(
-        weights=model_cfg.get("weights", "yolov8n.pt"),
-        device=model_cfg.get("device", 0),
-        imgsz=int(model_cfg.get("imgsz", 640)),
-        tracker_cfg=tracker_cfg_path,
-        conf=float(tracking_cfg.get("conf", 0.25)),
-        iou=float(tracking_cfg.get("iou", 0.45)),
-        max_det=int(tracking_cfg.get("max_det", 1000)),
-    )
+    # 初始化辅助列
+    if "reviewed" not in df.columns:
+        df["reviewed"] = False
+    else:
+        df["reviewed"] = df["reviewed"].astype(bool).fillna(False)
 
+    if "manual_plate" not in df.columns:
+        df["manual_plate"] = df.get(COLS["plate_text"], "").fillna("")
+    
+    # 初始化排除列 (Exclude)
+    if "is_excluded" not in df.columns:
+        df["is_excluded"] = False
+    else:
+        df["is_excluded"] = df["is_excluded"].astype(bool).fillna(False)
 
-def _extract_emergency_lane_mask(
-    result,
-    frame_shape: Tuple[int, int],
-    class_name: str = "emergency_lane",
-    fallback_class_id: int = 0,
-) -> Optional[np.ndarray]:
-    if result is None or result.masks is None or result.boxes is None:
-        return None
+    return df
 
-    frame_height, frame_width = frame_shape
+def get_task_data(task_name: str, csv_path: Path) -> Dict:
+    if SESSION_KEY not in st.session_state:
+        st.session_state[SESSION_KEY] = {}
+    
+    if task_name not in st.session_state[SESSION_KEY]:
+        st.session_state[SESSION_KEY][task_name] = {
+            "csv_path": csv_path,
+            "df": initialize_dataframe(csv_path),
+            "index": 0,
+        }
+    return st.session_state[SESSION_KEY][task_name]
 
-    target_class_id: Optional[int] = None
-    names = getattr(result, "names", None) or {}
-    for cls_id, name in names.items():
-        if name == class_name:
-            target_class_id = int(cls_id)
-            break
-
-    if target_class_id is None:
-        target_class_id = int(fallback_class_id)
-
-    class_ids = result.boxes.cls
-    if class_ids is None:
-        return None
-
-    cls_ids = class_ids.cpu().numpy() if hasattr(class_ids, "cpu") else np.asarray(class_ids)
-    polygons = getattr(result.masks, "xy", None) or []
-    mask_img = np.zeros((frame_height, frame_width), dtype=np.uint8)
-
-    for polygon, cls_id in zip(polygons, cls_ids):
-        if int(cls_id) == target_class_id:
-            cv2.fillPoly(mask_img, [polygon.astype(np.int32)], 1)
-
-    return mask_img.astype(bool) if np.any(mask_img) else None
-
-
-def _point_in_mask(point: Tuple[float, float], mask: Optional[np.ndarray]) -> bool:
-    if mask is None:
-        return False
-    h, w = mask.shape[:2]
-    x, y = int(point[0]), int(point[1])
-    if x < 0 or y < 0 or x >= w or y >= h:
-        return False
-    return bool(mask[y, x])
-
-
-def _overlay_lane_mask(frame: np.ndarray, mask: Optional[np.ndarray], color=(255, 255, 0), alpha: float = 0.3) -> np.ndarray:
-    if mask is None:
-        return frame
-    overlay = frame.copy()
-    overlay[mask] = color
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
-    return frame
-
-
-def _bbox_quality(bbox: Tuple[float, float, float, float], confidence: Optional[float]) -> float:
-    x1, y1, x2, y2 = bbox
-    area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
-    conf = confidence if confidence is not None else 1.0
-    return float(area * conf)
-
-
-def _lane_metrics(mask: Optional[np.ndarray], frame_size: Tuple[int, int]) -> Tuple[float, Optional[float]]:
-    width, height = frame_size
-    total_pixels = float(width * height) if width > 0 and height > 0 else 1.0
-    if mask is None:
-        return 0.0, None
-
-    area = float(np.count_nonzero(mask))
-    area_ratio = area / total_pixels
-
-    moments = cv2.moments(mask.astype(np.uint8))
-    if moments["m00"] == 0:
-        return area_ratio, None
-    cx = moments["m10"] / moments["m00"]
-    return area_ratio, float(cx / width) if width > 0 else None
-
-
-def _save_best_snapshot(
-    event: OccupancyEvent,
-    event_id: int,
-    snapshot_dir: Path,
-    show_tracks: bool,
-    show_footpoints: bool,
-) -> Optional[Path]:
-    best_snapshot = event.best_snapshot_data or {}
-    snapshot_frame = best_snapshot.get("frame") if isinstance(best_snapshot, dict) else None
-    if snapshot_frame is None:
-        return None
-
-    snapshot = snapshot_frame.copy()
-    _overlay_lane_mask(snapshot, best_snapshot.get("lane_mask"))
-    track_record = best_snapshot.get("track_record") if isinstance(best_snapshot, dict) else None
-    roi_polygon = best_snapshot.get("roi_polygon") if isinstance(best_snapshot, dict) else None
-    if track_record:
-        draw_overlays(
-            snapshot,
-            roi_polygon,
-            [track_record],
-            show_tracks,
-            show_footpoints,
-        )
-    cv2.putText(
-        snapshot,
-        f"Event {event_id} | Track {event.track_id}",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 0, 255),
-        2,
-    )
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    snap_path = snapshot_dir / f"event_{event_id:03d}.jpg"
-    success = cv2.imwrite(str(snap_path), snapshot)
-    if success and snap_path.exists():
-        event.best_frame_path = str(snap_path)
-        return snap_path
+def load_image_robust(path_str):
+    if not path_str or str(path_str).lower() == 'nan': return None
+    clean_path = str(path_str).strip().replace('"', '')
+    path_obj = Path(clean_path)
+    if path_obj.is_file():
+        try:
+            return Image.open(path_obj)
+        except:
+            return None
     return None
 
-
-def export_events(events, output_csv: Path, fps: float) -> None:
-    if not events:
-        print("No occupancy events detected; skipping CSV export.")
-        return
-    rows = []
-    for idx, event in enumerate(events, start=1):
-        start_time = event.start_frame / fps if fps else None
-        end_time = event.end_frame / fps if fps else None
-        best_bbox_str = ""
-        snapshot_data = event.best_snapshot_data if isinstance(event.best_snapshot_data, dict) else {}
-        track_record = snapshot_data.get("track_record") if isinstance(snapshot_data, dict) else None
-        bbox = track_record.get("bbox") if isinstance(track_record, dict) else None
-        if bbox and len(bbox) >= 4:
-            best_bbox_str = ",".join(str(float(coord)) for coord in bbox[:4])
-        row: Dict[str, object] = {
-            "event_id": idx,
-            "track_id": event.track_id,
-            "start_frame": event.start_frame,
-            "end_frame": event.end_frame,
-            "duration_frames": event.duration_frames,
-            "start_time_s": start_time,
-            "end_time_s": end_time,
-            "best_frame_path": event.best_frame_path or "",
-            "plate_crop_path": event.plate_crop_path or "",
-            "best_bbox": best_bbox_str,
-        }
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    df.to_csv(output_csv, index=False, encoding="utf-8-sig")
-    print(f"Saved CSV to {output_csv}")
-
-
-def _compute_clip_range(
-    event: OccupancyEvent,
-    fps: float,
-    frame_count: Optional[int],
-    pre_seconds: float,
-    post_seconds: float,
-) -> Tuple[int, int]:
-    safe_fps = fps if fps > 0 else 25.0
-    pre_frames = int(max(pre_seconds, 0.0) * safe_fps)
-    post_frames = int(max(post_seconds, 0.0) * safe_fps)
-    start = max(event.start_frame - pre_frames, 0)
-    end = event.end_frame + post_frames
-    if frame_count is not None and frame_count > 0:
-        end = min(end, frame_count - 1)
-    if end < start:
-        end = start
-    return start, end
-
-
-def _write_video_segment(
-    video_path: Path,
-    output_path: Path,
-    start_frame: int,
-    end_frame: int,
-    fps: float,
-    frame_size: Tuple[int, int],
-) -> bool:
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        return False
-    capture.set(cv2.CAP_PROP_POS_FRAMES, max(start_frame, 0))
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer: Optional[cv2.VideoWriter] = None
-    frame_idx = start_frame
-    success = False
-    width, height = frame_size
-
-    while frame_idx <= end_frame:
-        has_frame, frame = capture.read()
-        if not has_frame or frame is None:
-            break
-        if writer is None:
-            frame_height, frame_width = frame.shape[:2]
-            if width <= 0 or height <= 0:
-                width, height = frame_width, frame_height
-            writer = cv2.VideoWriter(str(output_path), fourcc, fps if fps > 0 else 25.0, (width, height))
-            if not writer.isOpened():
-                capture.release()
-                return False
-        writer.write(frame)
-        frame_idx += 1
-        success = True
-
-    capture.release()
-    if writer is not None:
-        writer.release()
-    return success
-
-
-def export_event_clips(
-    events: List[OccupancyEvent],
-    metadata: VideoMetadata,
-    output_dir: Path,
-    fps: float,
-    pre_seconds: float,
-    post_seconds: float,
-    clip_subdir: str,
-) -> None:
-    if not events:
-        print("No occupancy events detected; skipping clip export.")
-        return
-
-    clip_dir = output_dir / clip_subdir
-    clip_dir.mkdir(parents=True, exist_ok=True)
-
-    effective_fps = fps if fps > 0 else (metadata.fps if metadata.fps > 0 else 25.0)
-    frame_count = metadata.frame_count if metadata.frame_count > 0 else None
-
-    for index, event in enumerate(events, start=1):
-        clip_start, clip_end = _compute_clip_range(event, effective_fps, frame_count, pre_seconds, post_seconds)
-        clip_name = f"{metadata.path.stem}_event{index:02d}_track{event.track_id}_{clip_start:06d}-{clip_end:06d}.mp4"
-        clip_path = clip_dir / clip_name
-        if _write_video_segment(metadata.path, clip_path, clip_start, clip_end, effective_fps, metadata.frame_size):
-            print(f"Saved clip to {clip_path}")
-        else:
-            print(f"Failed to export clip for track {event.track_id} ({clip_start}-{clip_end}).")
-
-
-def _classify_event_motion(event: OccupancyEvent, metadata: VideoMetadata) -> str:
-    if len(event.frames) < 2:
-        return "unknown"
-
-    y_values = [frame.footpoint[1] for frame in event.frames]
-    dy_total = y_values[-1] - y_values[0]
-    step_deltas = [abs(y_values[i + 1] - y_values[i]) for i in range(len(y_values) - 1)]
-    max_step = max(step_deltas, default=0.0)
-
-    heights = [frame.bbox[3] - frame.bbox[1] for frame in event.frames]
-    avg_height = sum(heights) / len(heights) if heights else 1.0
-    avg_height = max(avg_height, 1.0)
-
-    total_threshold = avg_height * 0.35
-    step_threshold = avg_height * 0.25
-
-    if abs(dy_total) <= total_threshold and max_step <= step_threshold:
-        return "front_static"
-
-    if dy_total >= 0:
-        return "rear_approach"
-
-    return "unknown"
-
-
-def _get_float_config(value: object, default: float) -> float:
+def crop_plate_dynamic(full_img, bbox_str):
+    """如果硬盘上没有特写图，就根据坐标现场切一个"""
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
+        # bbox_str 格式通常是 "[x1, y1, x2, y2]"
+        bbox = ast.literal_eval(bbox_str)
+        if isinstance(bbox, list) and len(bbox) == 4:
+            # PIL crop 接受 (left, top, right, bottom)
+            # 注意：如果坐标是浮点数，需要转int
+            x1, y1, x2, y2 = map(int, bbox)
+            # 增加一点点padding防止切太紧
+            padding = 5
+            width, height = full_img.size
+            x1 = max(0, x1 - padding)
+            y1 = max(0, y1 - padding)
+            x2 = min(width, x2 + padding)
+            y2 = min(height, y2 + padding)
+            
+            return full_img.crop((x1, y1, x2, y2))
+    except Exception as e:
+        print(f"Cropping error: {e}")
+        return None
+    return None
 
+# ================= 主程序 =================
+def main():
+    st.set_page_config(page_title="违规复核终端", page_icon="🚓", layout="wide")
+    inject_custom_css() # 注入样式
+    st.title("🚓 应急车道违规复核终端")
 
-def _iter_video_files(directory: Path) -> Iterable[Path]:
-    supported = {".mp4", ".avi", ".mov", ".mkv"}
-    for path in sorted(directory.iterdir()):
-        if path.is_file() and path.suffix.lower() in supported:
-            yield path
+    tasks = discover_tasks(OUTPUTS_DIR)
+    if not tasks:
+        st.error("未找到任务数据 (data/outputs)")
+        st.stop()
 
+    # 侧边栏
+    task_names = [t[0] for t in tasks]
+    selected_task = st.sidebar.selectbox("选择任务", task_names)
+    csv_path = dict(tasks)[selected_task]
+    
+    # 加载数据
+    task_data = get_task_data(selected_task, csv_path)
+    df = task_data["df"]
+    
+    # 翻页逻辑
+    col_stat1, col_stat2, col_stat3 = st.columns(3)
+    idx = task_data["index"]
+    
+    # 顶部统计
+    reviewed_count = df["reviewed"].sum()
+    total = len(df)
+    col_stat1.metric("总事件", total)
+    col_stat2.metric("复核进度", f"{reviewed_count}/{total}")
+    
+    # 翻页按钮
+    c_prev, c_curr, c_next = st.columns([1, 2, 1])
+    with c_prev:
+        if st.button("⬅️ 上一条", key="btn_prev", use_container_width=True):
+            task_data["index"] = max(0, idx - 1)
+            st.rerun()
+    with c_next:
+        if st.button("下一条 ➡️", key="btn_next", use_container_width=True):
+            task_data["index"] = min(total - 1, idx + 1)
+            st.rerun()
 
-def process_video(source_path: Path, base_config: Dict[str, object], args: argparse.Namespace) -> None:
-    config = copy.deepcopy(base_config)
-    model_cfg = config.get("model", {})
-    tracking_cfg = dict(config.get("tracking", {}) or {})
-    tracker_cfg_rel = tracking_cfg.get("tracker_config", str(DEFAULT_TRACKER_CFG_REL))
-    tracker_cfg = resolve_path(PROJECT_ROOT, tracker_cfg_rel)
-    lpr_cfg = dict(config.get("license_plate_recognition") or {})
-    lpr_enabled = bool(lpr_cfg.get("enable")) or args.lpr
+    # --- 核心内容区 ---
+    if total == 0:
+        st.info("数据为空")
+        st.stop()
 
-    roi_cfg = config.get("roi", {}) or {}
-    dynamic_seg_cfg = dict(roi_cfg.get("dynamic_seg") or {})
-    lane_conf = dynamic_seg_cfg.get("conf")
-    lane_imgsz = dynamic_seg_cfg.get("imgsz")
-    lane_class_id = int(dynamic_seg_cfg.get("class_id", 0))
-    lane_class_name = str(dynamic_seg_cfg.get("class_name", "emergency_lane"))
-
-    lane_weights_path = resolve_path(PROJECT_ROOT, args.lane_weights)
-    lane_model = YOLO(str(lane_weights_path))
-    print(f"Lane model classes: {lane_model.names}")
-    lane_predict_args: Dict[str, object] = {"verbose": False}
-    lane_predict_args["retina_masks"] = False
-    if model_cfg.get("device") is not None:
-        lane_predict_args["device"] = model_cfg.get("device", 0)
-    if lane_conf is not None:
-        lane_predict_args["conf"] = float(lane_conf)
-    if lane_imgsz is not None:
-        lane_predict_args["imgsz"] = int(lane_imgsz)
-
-    filters_cfg = dict(roi_cfg.get("dynamic_filters") or {})
-    roi_manager = ROIManager(
-        min_area_ratio=float(filters_cfg.get("min_area_ratio", 0.005)),
-        max_area_ratio=float(filters_cfg.get("max_area_ratio", 0.4)),
-        min_centroid_x_ratio=float(filters_cfg.get("min_centroid_x_ratio", 0.5)),
-        expected_centroid=(
-            float(filters_cfg.get("min_centroid_x_ratio", 0.55)),
-            float(
-                filters_cfg.get(
-                    "min_centroid_y_ratio",
-                    filters_cfg.get("max_centroid_y_ratio", 0.55),
-                )
-            ),
-        ),
-        stability_ratio=float(filters_cfg.get("max_centroid_jump", 0.25)),
-        good_streak_thresh=int(filters_cfg.get("good_streak", 5)),
-        bad_streak_tolerance=int(filters_cfg.get("bad_streak_tolerance", 5)),
-    )
-
-    metadata = probe_video(source_path)
-    print(
-        f"Video: {metadata.path.name} | FPS: {metadata.fps:.2f} | Frames: {metadata.frame_count} | Size: {metadata.frame_size}"
-    )
-
-    events_cfg = config.get("events", {})
-    accumulator = EventAccumulator(
-        min_frames_in=int(events_cfg.get("min_frames_in", 5)),
-        min_frames_out=int(events_cfg.get("min_frames_out", 5)),
-    )
-
-    render_cfg = config.get("render", {})
-    show_tracks = bool(render_cfg.get("show_tracks", True))
-    show_footpoints = bool(render_cfg.get("show_footpoints", True))
-
-    outputs_cfg = dict(config.get("outputs") or config.get("output") or {})
-    output_dir = project_path("data", "outputs", source_path.stem)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    outputs_cfg["video_filename"] = f"{source_path.stem}.mp4"
-    outputs_cfg["csv_filename"] = f"{source_path.stem}.csv"
-    snapshot_dir = output_dir / "snapshots"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    failure_dir = output_dir / "failures"
-    debug_log_path = output_dir / "debug_log.csv"
-    if args.diagnose:
-        failure_dir.mkdir(parents=True, exist_ok=True)
-
-    clip_pre_seconds = _get_float_config(outputs_cfg.get("clip_pre_seconds"), 1.0)
-    clip_post_seconds = _get_float_config(outputs_cfg.get("clip_post_seconds"), 1.0)
-    clip_subdir = str(outputs_cfg.get("clip_dir") or "clips")
-
-    tracker = prepare_tracker(config, tracker_cfg)
-    video_writer = None
-    fps = metadata.fps or 25.0
-    video_output_path = output_dir / f"{source_path.stem}.mp4"
-    csv_output_path = output_dir / f"{source_path.stem}.csv"
-    debug_rows: List[Dict[str, object]] = []
-    last_failure_frame = -int(math.ceil(fps))
-    roi_active = False
-    roi_reason = "uninitialized"
-    active_polygon: List[Tuple[float, float]] = []
-
-    try:
-        for frame_idx, result in enumerate(tracker.track(source_path)):
-            frame = result.orig_img
-            if frame is None:
-                continue
-            if frame_idx == 0:
-                if args.save_video:
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(
-                        str(video_output_path),
-                        fourcc,
-                        fps,
-                        (frame.shape[1], frame.shape[0]),
-                    )
-
-            lane_results = lane_model.predict(source=frame, **lane_predict_args)
-            frame_height, frame_width = frame.shape[:2]
-            lane_mask: Optional[np.ndarray] = None
-            if lane_results and lane_results[0].masks is not None:
-                lane_result = lane_results[0]
-                lane_mask_img = np.zeros(frame.shape[:2], dtype=np.uint8)
-                polygons = lane_result.masks.xy or []
-                class_ids = lane_result.boxes.cls if lane_result.boxes is not None else None
-                cls_ids = class_ids.cpu().numpy() if hasattr(class_ids, "cpu") else np.asarray(class_ids) if class_ids is not None else None
-                if cls_ids is not None:
-                    for polygon, cls_id in zip(polygons, cls_ids):
-                        if int(cls_id) == lane_class_id:
-                            cv2.fillPoly(lane_mask_img, [polygon.astype(np.int32)], 1)
-                if np.any(lane_mask_img):
-                    lane_mask = lane_mask_img.astype(bool)
-
-            if lane_mask is None:
-                print(f"[DEBUG] Frame {frame_idx}: YOLO detected no mask for class {lane_class_id}")
-
-            roi_status = roi_manager.update_from_segmentation(lane_mask, (frame_width, frame_height))
-            if not roi_status.valid:
-                print(f"[DEBUG] Frame {frame_idx}: ROI rejected by Manager. Reason: {roi_status.reason}")
-
-            roi_active = roi_status.valid
-            active_polygon = roi_status.polygon if roi_active else []
-
-            roi_reason = roi_status.reason or ("ok" if roi_active else "unknown")
-            ego_point = (frame_width / 2.0, frame_height - 1)
-            ego_in_lane = _point_in_mask(ego_point, lane_mask)
-            lane_area_ratio, lane_centroid_x = _lane_metrics(lane_mask, (frame_width, frame_height))
-
-            boxes = getattr(result, "boxes", None)
-            track_entries: List[Dict[str, object]] = []
-            num_vehicles_on_right = 0
-            coords_list: List[List[float]] = []
-            if boxes is not None and boxes.id is not None:
-                ids = boxes.id
-                if hasattr(ids, "cpu"):
-                    ids = ids.cpu().numpy()
-                ids_list = np.array(ids).flatten().tolist()
-
-                coords = boxes.xyxy
-                if hasattr(coords, "cpu"):
-                    coords = coords.cpu().numpy()
-                coords_list = np.array(coords).tolist()
-
-                confs = boxes.conf
-                if confs is not None and hasattr(confs, "cpu"):
-                    confs = confs.cpu().numpy()
-                conf_list = (
-                    np.array(confs).flatten().tolist() if confs is not None else [None] * len(coords_list)
-                )
-
-                total = min(len(ids_list), len(coords_list))
-                for idx in range(total):
-                    track_id = ids_list[idx]
-                    if track_id is None or (isinstance(track_id, float) and math.isnan(track_id)):
-                        continue
-                    track_id_int = int(track_id)
-
-                    bbox = coords_list[idx] if idx < len(coords_list) else None
-                    if bbox is None or len(bbox) < 4:
-                        continue
-                    conf = conf_list[idx] if idx < len(conf_list) else None
-                    x1, y1, x2, y2 = bbox[:4]
-
-                    center_x = (float(x1) + float(x2)) / 2.0
-                    if frame_width > 0 and center_x / float(frame_width) > 0.6:
-                        num_vehicles_on_right += 1
-
-                    footpoint = ((x1 + x2) / 2.0, y2)
-                    inside = False
-                    if roi_active and not ego_in_lane and active_polygon:
-                        inside = point_in_polygon(footpoint, active_polygon)
-                    track_entries.append(
-                        {
-                            "track_id": track_id_int,
-                            "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                            "footpoint": [float(footpoint[0]), float(footpoint[1])],
-                            "inside": inside,
-                            "confidence": float(conf) if conf is not None else None,
-                            "frame": frame,
-                            "lane_mask": lane_mask,
-                            "roi_polygon": list(active_polygon) if roi_active else [],
-                        }
-                    )
-
-            new_events = accumulator.update(frame_idx, track_entries, roi_active=roi_active)
-            completed_start = len(accumulator.completed) - len(new_events)
-            for offset, event in enumerate(new_events):
-                duration = event.duration_frames
-                event_id = completed_start + offset + 1
-                print(
-                    f"Completed event: track {event.track_id} | frames {event.start_frame}-{event.end_frame} | duration {duration}"
-                )
-                snap_path = _save_best_snapshot(event, event_id, snapshot_dir, show_tracks, show_footpoints)
-
-            if args.diagnose:
-                debug_rows.append(
-                    {
-                        "frame_idx": frame_idx,
-                        "timestamp_s": float(frame_idx / fps) if fps else 0.0,
-                        "roi_active": int(roi_active),
-                        "roi_reason": roi_reason,
-                        "lane_area_ratio": lane_area_ratio,
-                        "lane_centroid_x": lane_centroid_x,
-                        "num_vehicles_on_right": num_vehicles_on_right,
-                    }
-                )
-
-                should_snapshot = (
-                    not roi_active
-                    and num_vehicles_on_right > 0
-                    and frame_idx - last_failure_frame >= int(max(1, round(fps)))
-                )
-                if should_snapshot:
-                    failure_frame = frame.copy()
-                    if lane_mask is not None:
-                        overlay = failure_frame.copy()
-                        overlay[lane_mask] = (255, 0, 0)
-                        cv2.addWeighted(overlay, 0.4, failure_frame, 0.6, 0, dst=failure_frame)
-                    if coords_list:
-                        for bbox in coords_list:
-                            if bbox is None or len(bbox) < 4:
-                                continue
-                            bx1, by1, bx2, by2 = map(int, bbox[:4])
-                            cv2.rectangle(failure_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-                    cv2.putText(
-                        failure_frame,
-                        f"Frame {frame_idx} | reason: {roi_reason}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 255),
-                        2,
-                    )
-                    failure_path = failure_dir / f"frame_{frame_idx:06d}_{roi_reason}.jpg"
-                    cv2.imwrite(str(failure_path), failure_frame)
-                    last_failure_frame = frame_idx
-
-            annotated = frame.copy()
-            _overlay_lane_mask(annotated, lane_mask if roi_active else None)
-            draw_overlays(
-                annotated,
-                active_polygon if roi_active else None,
-                track_entries,
-                show_tracks,
-                show_footpoints,
-            )
-            if args.save_video and video_writer is not None:
-                video_writer.write(annotated)
-
-    finally:
-        if video_writer is not None:
-            video_writer.release()
-
-    accumulator.flush()
-    events = list(accumulator.completed)
-    if events:
-        for idx, event in enumerate(events, start=1):
-            if event.best_frame_path and Path(event.best_frame_path).exists():
-                continue
-            _save_best_snapshot(event, idx, snapshot_dir, show_tracks, show_footpoints)
-    if args.diagnose and debug_rows:
-        debug_df = pd.DataFrame(debug_rows)
-        debug_df.to_csv(debug_log_path, index=False)
-        print(f"Saved diagnostic log to {debug_log_path}")
-
-        try:
-            import matplotlib.pyplot as plt
-
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-            times = debug_df["timestamp_s"].tolist()
-            ratios = debug_df["lane_area_ratio"].tolist()
-            roi_states = debug_df["roi_active"].tolist()
-            ax1.plot(times, ratios, label="lane_area_ratio", color="blue")
-            if times:
-                for idx in range(len(times) - 1):
-                    start_t = times[idx]
-                    end_t = times[idx + 1]
-                    color = "green" if roi_states[idx] else "red"
-                    ax1.axvspan(start_t, end_t, color=color, alpha=0.1)
-            ax1.set_xlabel("Time (s)")
-            ax1.set_ylabel("Lane area ratio")
-            ax1.set_title("Lane area ratio over time")
-            ax1.legend()
-
-            reasons = Counter(debug_df["roi_reason"].tolist())
-            ax2.bar(reasons.keys(), reasons.values(), color="purple")
-            ax2.set_ylabel("Count")
-            ax2.set_title("ROI rejection reasons")
-            plt.xticks(rotation=45, ha="right")
-            plt.tight_layout()
-
-            report_path = output_dir / "report_analysis.png"
-            plt.savefig(report_path, bbox_inches="tight")
-            plt.close(fig)
-            print(f"Saved diagnostic report to {report_path}")
-        except Exception as exc:  # pragma: no cover - best effort plotting
-            print(f"Skipping diagnostic plots due to error: {exc}")
-
-    if args.save_csv or lpr_enabled:
-        export_events(events, csv_output_path, fps)
-
-    if lpr_enabled:
-        if not events:
-            print(f"LPR enabled but no events detected for {source_path.name}; skipping LPR enrichment.")
-        elif not csv_output_path.exists():
-            print(f"LPR enabled but base CSV not found at {csv_output_path}; skipping LPR enrichment.")
+    row = df.iloc[task_data["index"]]
+    
+    c_img, c_detail = st.columns([2, 1])
+    
+    # 1. 左侧大图
+    with c_img:
+        full_img = load_image_robust(row.get(COLS["img_path"]))
+        if full_img:
+            st.image(full_img, use_container_width=True, caption="占用画面 (Evidence)")
         else:
-            output_csv_cfg = lpr_cfg.get("output_csv", "auto")
-            if not output_csv_cfg or str(output_csv_cfg).lower() == "auto":
-                lpr_output_csv = csv_output_path.with_name("events_with_plate.csv")
-            else:
-                lpr_output_csv = resolve_path(PROJECT_ROOT, str(output_csv_cfg))
-            enriched_path = enrich_events_csv_with_lpr(
-                str(csv_output_path), str(lpr_output_csv), lpr_cfg
-            )
-            print(f"Saved LPR-enriched CSV to {enriched_path}")
+            st.warning("原始证据图丢失")
 
-    if args.clip:
-        export_event_clips(events, metadata, output_dir, fps, clip_pre_seconds, clip_post_seconds, clip_subdir)
+    # 2. 右侧详情与操作
+    with c_detail:
+        st.subheader("🔎 详情面板")
+        
+        # --- 动态车牌显示 ---
+        # 优先读硬盘上的小图，如果没有，就用大图切
+        crop_img = load_image_robust(row.get(COLS["plate_crop"]))
+        
+        if crop_img is None and full_img is not None and pd.notna(row.get(COLS["bbox"])):
+            # 现场裁切！
+            crop_img = crop_plate_dynamic(full_img, row[COLS["bbox"]])
+            caption_txt = "车牌截图 (动态裁切)"
+        else:
+            caption_txt = "车牌截图 (文件)"
 
+        if crop_img:
+            st.image(crop_img, width=250, caption=caption_txt)
+        else:
+            st.info("无法获取车牌图像")
 
-def main() -> None:
-    args = parse_args()
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = (PROJECT_ROOT / config_path).resolve()
-    config = load_config(config_path)
+        # --- 识别状态 ---
+        lpr_val = str(row.get(COLS["lpr_status"], "unknown"))
+        st.markdown("**车牌文本识别**")
+        if lpr_val.lower() == 'ok':
+            st.markdown('<span class="status-badge-ok">✅ 成功运行</span>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<span class="status-badge-fail">⚠️ {lpr_val}</span>', unsafe_allow_html=True)
+        
+        st.divider()
 
-    source_path = resolve_path(PROJECT_ROOT, args.source)
-    if source_path.is_dir():
-        video_files = list(_iter_video_files(source_path))
-        if not video_files:
-            print(f"No supported video files found in {source_path}")
-            return
-        for video_file in video_files:
-            process_video(video_file, config, args)
-    else:
-        process_video(source_path, config, args)
+        # --- 复核操作表单 ---
+        
+        # 显示当前的复核状态
+        is_reviewed = row.get("reviewed", False)
+        is_excluded = row.get("is_excluded", False)
+        
+        if is_excluded:
+            st.markdown("当前状态：<span style='color:blue;font-weight:bold'>🚫 已排除 (非违规)</span>", unsafe_allow_html=True)
+        elif is_reviewed:
+            st.markdown("当前状态：<span class='review-status-yes'>✅ 已复核</span>", unsafe_allow_html=True)
+        else:
+            st.markdown("当前状态：<span class='review-status-no'>🔴 未复核</span>", unsafe_allow_html=True)
 
+        manual_val = row.get("manual_plate", "")
+        # 如果是空的，默认填入 AI 识别的结果
+        if pd.isna(manual_val) or manual_val == "":
+            manual_val = row.get(COLS["plate_text"], "")
+
+        new_plate = st.text_input("人工校正车牌", value=str(manual_val))
+        
+        # --- 按钮区 (保存 & 排除) ---
+        # 使用列来横向排列按钮
+        b_col1, b_col2 = st.columns(2)
+        
+        with b_col1:
+            # 绿色按钮 (Primary)
+            if st.button("✅ 保存并通过", type="primary", use_container_width=True):
+                # 写入数据
+                df.at[task_data["index"], "manual_plate"] = new_plate
+                df.at[task_data["index"], "reviewed"] = True
+                df.at[task_data["index"], "is_excluded"] = False # 如果保存通过，就取消排除状态
+                # 存盘
+                df.to_csv(task_data["csv_path"], index=False)
+                task_data["df"] = df
+                st.toast("✅ 已保存为【已复核】")
+                st.rerun()
+
+        with b_col2:
+            # 普通按钮 (代表蓝色/排除)
+            if st.button("🚫 排除此记录", use_container_width=True):
+                df.at[task_data["index"], "is_excluded"] = True
+                df.at[task_data["index"], "reviewed"] = True # 排除也算复核过的一种
+                # 存盘
+                df.to_csv(task_data["csv_path"], index=False)
+                task_data["df"] = df
+                st.toast("🚫 已标记为【排除】")
+                st.rerun()
 
 if __name__ == "__main__":
     main()
