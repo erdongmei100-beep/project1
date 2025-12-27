@@ -21,9 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
 CSV_NAME = "events_with_plate.csv"
 SESSION_KEY = "review_tasks"
+
+# 核心字段映射配置
 COLS = {
     "img_path": "best_frame_path",
-    "plate_crop": "plate_crop",
+    "plate_crop": "plate_crop",       # 程序内部统一使用 plate_crop
     "plate_text": "plate_text",
     "plate_score": "plate_score",
     "lpr_status": "lpr_status",
@@ -50,7 +52,13 @@ def initialize_dataframe(csv_path: Path) -> pd.DataFrame:
     """Load the CSV and ensure review helper columns exist."""
 
     df = pd.read_csv(csv_path)
+    # 1. 清理列名空格
     df.columns = df.columns.str.strip()
+
+    # 2. 字段兼容处理：如果 CSV 里是 plate_crop_path，重命名为 plate_crop 以匹配配置
+    if "plate_crop_path" in df.columns and COLS["plate_crop"] not in df.columns:
+        df.rename(columns={"plate_crop_path": COLS["plate_crop"]}, inplace=True)
+
     # Keep expected columns as strings where appropriate to avoid type surprises.
     for col in [COLS["img_path"], COLS["plate_crop"], COLS["plate_text"], COLS["lpr_status"]]:
         if col in df.columns:
@@ -105,11 +113,18 @@ def clamp_index(idx: int, total: int) -> int:
 def display_image(image_path: str | os.PathLike[str], caption: str) -> None:
     """Render an image if possible; otherwise show a warning placeholder."""
 
-    if not image_path:
+    if not image_path or str(image_path).lower() == 'nan':
         st.warning(f"缺少图片：{caption}")
         return
 
     path_obj = Path(image_path)
+    
+    # 尝试处理 Windows 路径中可能存在的引号问题
+    if not path_obj.exists():
+        # 有时候路径可能包含多余的引号或空格
+        clean_path = str(image_path).strip().replace('"', '')
+        path_obj = Path(clean_path)
+
     if not path_obj.is_file():
         st.warning(f"未找到图片文件：{path_obj}")
         return
@@ -120,7 +135,7 @@ def display_image(image_path: str | os.PathLike[str], caption: str) -> None:
         st.warning(f"无法加载图片 {path_obj.name}: {exc}")
         return
 
-    st.image(image, use_column_width=True, caption=caption)
+    st.image(image, use_container_width=True, caption=caption)
 
 
 def main() -> None:
@@ -164,35 +179,39 @@ def main() -> None:
 
     metric_col1, metric_col2, metric_col3 = st.columns(3)
     metric_col1.metric("总违规事件", f"{total_events}")
-    metric_col2.metric("AI 识别置信度", f"{avg_confidence:.3f}" if pd.notna(avg_confidence) else "N/A")
+    # 修改 1: AI 识别置信度保留两位小数
+    metric_col2.metric("AI 识别置信度", f"{avg_confidence:.2f}" if pd.notna(avg_confidence) else "N/A")
     metric_col3.metric("复核进度", f"{reviewed_count}/{total_events}")
 
     navigation_left, navigation_right = st.columns([1, 1])
     with navigation_left:
         if st.button("上一条", disabled=current_index <= 0):
             task_data["index"] = clamp_index(current_index - 1, total_events)
-            st.experimental_rerun()
+            st.rerun()
 
     with navigation_right:
         if st.button("下一条", disabled=current_index >= total_events - 1):
             task_data["index"] = clamp_index(current_index + 1, total_events)
-            st.experimental_rerun()
+            st.rerun()
 
     current_row = df.iloc[task_data["index"]]
 
     left_col, right_col = st.columns([2, 1])
     with left_col:
-        display_image(current_row.get(COLS["img_path"], ""), caption="违规证据帧")
+        # 修改 2: 标题从“违规证据帧”改为“占用画面”
+        display_image(current_row.get(COLS["img_path"], ""), caption="占用画面")
 
     with right_col:
         st.subheader("车牌区域")
-        # If plate_crop becomes plate_crop_path in future exports, update COLS accordingly.
         display_image(current_row.get(COLS["plate_crop"], ""), caption="车牌截图")
 
         st.markdown("**AI 识别结果**")
         st.write(f"车牌号：{current_row.get(COLS['plate_text'], '未知')}")
+        
+        # 修改 3: 单条记录置信度也保留两位小数
         if pd.notna(current_row.get(COLS["plate_score"])):
-            st.write(f"置信度：{float(current_row.get(COLS['plate_score'])):.3f}")
+            st.write(f"置信度：{float(current_row.get(COLS['plate_score'])):.2f}")
+            
         st.write(f"状态：{current_row.get(COLS['lpr_status'], '未知')}")
 
         manual_default = current_row.get("manual_plate") or current_row.get(COLS["plate_text"]) or ""
