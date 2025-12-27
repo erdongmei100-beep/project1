@@ -63,6 +63,13 @@ def inject_custom_css():
             font-size: 1.2em;
             font-weight: bold;
         }
+        /* 不可编辑的灰字样式 */
+        .read-only-text {
+            color: #6c757d;
+            font-size: 14px;
+            margin-top: 5px;
+            font-family: monospace;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -86,6 +93,10 @@ def initialize_dataframe(csv_path: Path) -> pd.DataFrame:
     # 兼容处理
     if "plate_crop_path" in df.columns and COLS["plate_crop"] not in df.columns:
         df.rename(columns={"plate_crop_path": COLS["plate_crop"]}, inplace=True)
+
+    # 确保置信度列为数值型
+    if COLS["plate_score"] in df.columns:
+        df[COLS["plate_score"]] = pd.to_numeric(df[COLS["plate_score"]], errors='coerce')
 
     # 初始化辅助列
     if "reviewed" not in df.columns:
@@ -151,114 +162,4 @@ def main():
 
     tasks = discover_tasks(OUTPUTS_DIR)
     if not tasks:
-        st.error("未找到任务数据 (data/outputs)")
-        st.stop()
-
-    task_names = [t[0] for t in tasks]
-    selected_task = st.sidebar.selectbox("选择任务", task_names)
-    csv_path = dict(tasks)[selected_task]
-    
-    task_data = get_task_data(selected_task, csv_path)
-    df = task_data["df"]
-    
-    col_stat1, col_stat2, col_stat3 = st.columns(3)
-    idx = task_data["index"]
-    
-    reviewed_count = df["reviewed"].sum()
-    total = len(df)
-    col_stat1.metric("总事件", total)
-    col_stat2.metric("复核进度", f"{reviewed_count}/{total}")
-    
-    c_prev, c_curr, c_next = st.columns([1, 2, 1])
-    with c_prev:
-        if st.button("⬅️ 上一条", key="btn_prev", use_container_width=True):
-            task_data["index"] = max(0, idx - 1)
-            st.rerun()
-    with c_next:
-        if st.button("下一条 ➡️", key="btn_next", use_container_width=True):
-            task_data["index"] = min(total - 1, idx + 1)
-            st.rerun()
-
-    if total == 0:
-        st.info("数据为空")
-        st.stop()
-
-    row = df.iloc[task_data["index"]]
-    
-    c_img, c_detail = st.columns([2, 1])
-    
-    with c_img:
-        full_img = load_image_robust(row.get(COLS["img_path"]))
-        if full_img:
-            st.image(full_img, use_container_width=True, caption="占用画面 (Evidence)")
-        else:
-            st.warning("原始证据图丢失")
-
-    with c_detail:
-        st.subheader("🔎 详情面板")
-        
-        # --- 动态车牌显示 ---
-        crop_img = load_image_robust(row.get(COLS["plate_crop"]))
-        
-        if crop_img is None and full_img is not None and pd.notna(row.get(COLS["bbox"])):
-            crop_img = crop_plate_dynamic(full_img, row[COLS["bbox"]])
-
-        # 修改 1：去掉了 (动态裁剪) 的后缀，统一显示文案
-        caption_txt = "车牌截图"
-
-        if crop_img:
-            st.image(crop_img, width=250, caption=caption_txt)
-        else:
-            st.info("无法获取车牌图像")
-
-        # --- 识别状态 ---
-        lpr_val = str(row.get(COLS["lpr_status"], "unknown"))
-        st.markdown("**车牌文本识别**")
-        if lpr_val.lower() == 'ok':
-            st.markdown('<span class="status-badge-ok">✅ 成功运行</span>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<span class="status-badge-fail">⚠️ {lpr_val}</span>', unsafe_allow_html=True)
-        
-        st.divider()
-
-        # --- 复核操作表单 ---
-        is_reviewed = row.get("reviewed", False)
-        is_excluded = row.get("is_excluded", False)
-        
-        # 修改 2：修改了排除状态下的显示文案
-        if is_excluded:
-            st.markdown("当前状态：<span class='review-status-exclude'>🚫 已复核，非违规占用</span>", unsafe_allow_html=True)
-        elif is_reviewed:
-            st.markdown("当前状态：<span class='review-status-yes'>✅ 已复核</span>", unsafe_allow_html=True)
-        else:
-            st.markdown("当前状态：<span class='review-status-no'>🔴 未复核</span>", unsafe_allow_html=True)
-
-        manual_val = row.get("manual_plate", "")
-        if pd.isna(manual_val) or manual_val == "":
-            manual_val = row.get(COLS["plate_text"], "")
-
-        new_plate = st.text_input("人工校正车牌", value=str(manual_val))
-        
-        b_col1, b_col2 = st.columns(2)
-        
-        with b_col1:
-            if st.button("✅ 保存并通过", type="primary", use_container_width=True):
-                df.at[task_data["index"], "manual_plate"] = new_plate
-                df.at[task_data["index"], "reviewed"] = True
-                df.at[task_data["index"], "is_excluded"] = False
-                df.to_csv(task_data["csv_path"], index=False)
-                task_data["df"] = df
-                st.toast("✅ 已保存为【已复核】")
-                st.rerun()
-
-        with b_col2:
-            if st.button("🚫 排除此记录", use_container_width=True):
-                df.at[task_data["index"], "is_excluded"] = True
-                df.at[task_data["index"], "reviewed"] = True
-                df.to_csv(task_data["csv_path"], index=False)
-                task_data["df"] = df
-                st.toast("🚫 已标记为【排除】")
-                st.rerun()
-
-if __name__ == "__main__":
-    main()
+        st.error("未找到任务数据 (data/
