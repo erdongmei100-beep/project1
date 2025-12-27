@@ -21,6 +21,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
 CSV_NAME = "events_with_plate.csv"
 SESSION_KEY = "review_tasks"
+COLS = {
+    "img_path": "best_frame_path",
+    "plate_crop": "plate_crop",
+    "plate_text": "plate_text",
+    "plate_score": "plate_score",
+    "lpr_status": "lpr_status",
+}
 
 
 def discover_tasks(outputs_dir: Path) -> List[Tuple[str, Path]]:
@@ -43,13 +50,14 @@ def initialize_dataframe(csv_path: Path) -> pd.DataFrame:
     """Load the CSV and ensure review helper columns exist."""
 
     df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
     # Keep expected columns as strings where appropriate to avoid type surprises.
-    for col in ["best_frame", "plate_crop", "plate_text", "lpr_status"]:
+    for col in [COLS["img_path"], COLS["plate_crop"], COLS["plate_text"], COLS["lpr_status"]]:
         if col in df.columns:
             df[col] = df[col].astype(str)
 
-    if "plate_score" in df.columns:
-        df["plate_score"] = pd.to_numeric(df["plate_score"], errors="coerce")
+    if COLS["plate_score"] in df.columns:
+        df[COLS["plate_score"]] = pd.to_numeric(df[COLS["plate_score"]], errors="coerce")
 
     if "reviewed" not in df.columns:
         df["reviewed"] = False
@@ -57,9 +65,9 @@ def initialize_dataframe(csv_path: Path) -> pd.DataFrame:
         df["reviewed"] = df["reviewed"].astype(bool).fillna(False)
 
     if "manual_plate" not in df.columns:
-        df["manual_plate"] = df.get("plate_text", pd.Series(["" for _ in range(len(df))])).fillna("")
+        df["manual_plate"] = df.get(COLS["plate_text"], pd.Series(["" for _ in range(len(df))])).fillna("")
     else:
-        df["manual_plate"] = df["manual_plate"].fillna(df.get("plate_text", "")).fillna("")
+        df["manual_plate"] = df["manual_plate"].fillna(df.get(COLS["plate_text"], "")).fillna("")
 
     return df
 
@@ -149,8 +157,8 @@ def main() -> None:
 
     reviewed_count = int(df["reviewed"].sum()) if "reviewed" in df.columns else 0
     avg_confidence = (
-        df["plate_score"].mean()
-        if "plate_score" in df.columns and not df["plate_score"].empty
+        df[COLS["plate_score"]].mean()
+        if COLS["plate_score"] in df.columns and not df[COLS["plate_score"]].empty
         else float("nan")
     )
 
@@ -174,19 +182,20 @@ def main() -> None:
 
     left_col, right_col = st.columns([2, 1])
     with left_col:
-        display_image(current_row.get("best_frame", ""), caption="违规证据帧")
+        display_image(current_row.get(COLS["img_path"], ""), caption="违规证据帧")
 
     with right_col:
         st.subheader("车牌区域")
-        display_image(current_row.get("plate_crop", ""), caption="车牌截图")
+        # If plate_crop becomes plate_crop_path in future exports, update COLS accordingly.
+        display_image(current_row.get(COLS["plate_crop"], ""), caption="车牌截图")
 
         st.markdown("**AI 识别结果**")
-        st.write(f"车牌号：{current_row.get('plate_text', '未知')}")
-        if pd.notna(current_row.get("plate_score")):
-            st.write(f"置信度：{float(current_row.get('plate_score')):.3f}")
-        st.write(f"状态：{current_row.get('lpr_status', '未知')}")
+        st.write(f"车牌号：{current_row.get(COLS['plate_text'], '未知')}")
+        if pd.notna(current_row.get(COLS["plate_score"])):
+            st.write(f"置信度：{float(current_row.get(COLS['plate_score'])):.3f}")
+        st.write(f"状态：{current_row.get(COLS['lpr_status'], '未知')}")
 
-        manual_default = current_row.get("manual_plate") or current_row.get("plate_text") or ""
+        manual_default = current_row.get("manual_plate") or current_row.get(COLS["plate_text"]) or ""
         with st.form(key=f"review_form_{selected_task}_{task_data['index']}"):
             manual_plate = st.text_input("人工校正车牌", value=str(manual_default))
             reviewed_flag = st.checkbox("标记为已复核", value=bool(current_row.get("reviewed", False)))
