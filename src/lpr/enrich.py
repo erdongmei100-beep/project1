@@ -19,6 +19,7 @@ _LPR_MODEL: Optional[HyperLPR3Recognizer] = None
 _CROP_MARGIN: int = 15
 _INPUT_FIELD: str = "best_frame_path"
 _BBOX_FIELD: str = "best_bbox"
+_PLATE_CROP_DIR: Optional[Path] = None
 
 
 def _load_image(path: Path) -> Optional[np.ndarray]:
@@ -56,11 +57,44 @@ def _crop_with_margin(image: np.ndarray, bbox: Tuple[int, int, int, int], margin
     return image[y1:y2, x1:x2]
 
 
+def _safe_plate_crop(
+    image: np.ndarray, bbox: Optional[Tuple[int, int, int, int]]
+) -> Optional[np.ndarray]:
+    if bbox is None:
+        return None
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    return crop
+
+
+def _format_event_id(value: object, fallback: int) -> str:
+    if value is None:
+        return f"row_{fallback:05d}"
+    text = str(value).strip()
+    if not text:
+        return f"row_{fallback:05d}"
+    try:
+        numeric = int(float(text))
+        return f"event_{numeric:03d}"
+    except ValueError:
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+        return f"event_{safe}"
+
+
 def _init_worker(lpr_cfg: Dict) -> None:
-    global _LPR_MODEL, _CROP_MARGIN, _INPUT_FIELD, _BBOX_FIELD
+    global _LPR_MODEL, _CROP_MARGIN, _INPUT_FIELD, _BBOX_FIELD, _PLATE_CROP_DIR
     _CROP_MARGIN = int(lpr_cfg.get("crop_margin", 15) or 0)
     _INPUT_FIELD = lpr_cfg.get("input_field") or "best_frame_path"
     _BBOX_FIELD = lpr_cfg.get("bbox_field", "best_bbox")
+    plate_crop_dir = lpr_cfg.get("plate_crop_dir")
+    _PLATE_CROP_DIR = Path(plate_crop_dir) if plate_crop_dir else None
     _LPR_MODEL = HyperLPR3Recognizer(
         backend=lpr_cfg.get("backend", "onnxruntime-gpu"),
         model_dir=lpr_cfg.get("model_dir") or None,
@@ -69,38 +103,73 @@ def _init_worker(lpr_cfg: Dict) -> None:
 
 
 def _process_single_row(row: Dict) -> Dict[str, object]:
-    global _LPR_MODEL, _CROP_MARGIN, _INPUT_FIELD, _BBOX_FIELD
+    global _LPR_MODEL, _CROP_MARGIN, _INPUT_FIELD, _BBOX_FIELD, _PLATE_CROP_DIR
     try:
         image_value = str(row.get(_INPUT_FIELD) or "").strip()
         bbox_value = str(row.get(_BBOX_FIELD) or "").strip()
         image_path = Path(image_value) if image_value else None
         parsed_bbox = _parse_bbox(bbox_value)
+        row_index = int(row.get("__row_index", 0))
 
         if not image_value or image_path is None or not image_path.exists():
-            return {"plate_text": "", "plate_score": 0.0, "plate_bbox": "", "lpr_status": "missing_file"}
+            return {
+                "plate_text": "",
+                "plate_score": 0.0,
+                "plate_bbox": "",
+                "plate_crop_path": "",
+                "lpr_status": "missing_file",
+            }
 
         full_image = _load_image(image_path)
         if full_image is None:
-            return {"plate_text": "", "plate_score": 0.0, "plate_bbox": "", "lpr_status": "fail"}
+            return {
+                "plate_text": "",
+                "plate_score": 0.0,
+                "plate_bbox": "",
+                "plate_crop_path": "",
+                "lpr_status": "fail",
+            }
 
         vehicle_image = _crop_with_margin(full_image, parsed_bbox, _CROP_MARGIN) if parsed_bbox else None
         if vehicle_image is None:
             vehicle_image = full_image
 
         if _LPR_MODEL is None:
-            return {"plate_text": "", "plate_score": 0.0, "plate_bbox": "", "lpr_status": "fail"}
+            return {
+                "plate_text": "",
+                "plate_score": 0.0,
+                "plate_bbox": "",
+                "plate_crop_path": "",
+                "lpr_status": "fail",
+            }
 
         result = _LPR_MODEL.recognize(vehicle_image)
         plate_bbox = json.dumps(result.plate_bbox) if result.plate_bbox else ""
+        plate_crop_path = ""
+        if result.status == "ok" and _PLATE_CROP_DIR is not None:
+            plate_crop = _safe_plate_crop(vehicle_image, result.plate_bbox)
+            if plate_crop is not None:
+                _PLATE_CROP_DIR.mkdir(parents=True, exist_ok=True)
+                event_id = _format_event_id(row.get("event_id"), row_index)
+                crop_path = _PLATE_CROP_DIR / f"{event_id}_plate.jpg"
+                if cv2.imwrite(str(crop_path), plate_crop):
+                    plate_crop_path = str(crop_path)
         return {
             "plate_text": result.plate_text,
             "plate_score": result.plate_score,
             "plate_bbox": plate_bbox,
+            "plate_crop_path": plate_crop_path,
             "lpr_status": result.status,
         }
     except Exception as exc:
         logger.error("LPR worker failed on row %s: %s", row.get("event_id"), exc)
-        return {"plate_text": "", "plate_score": 0.0, "plate_bbox": "", "lpr_status": "fail"}
+        return {
+            "plate_text": "",
+            "plate_score": 0.0,
+            "plate_bbox": "",
+            "plate_crop_path": "",
+            "lpr_status": "fail",
+        }
 
 
 def _determine_input_field(df: pd.DataFrame, configured_field: str | None) -> str:
@@ -133,14 +202,17 @@ def enrich_events_csv_with_lpr(input_csv: str, output_csv: str | None, cfg: Dict
     df["plate_text"] = ""
     df["plate_score"] = 0.0
     df["plate_bbox"] = ""
+    df["plate_crop_path"] = ""
     df["lpr_status"] = ""
 
     status_counter: Dict[str, int] = {}
     rows: List[Dict[str, object]] = []
     for idx, row in df.iterrows():
         row_dict = row.to_dict()
+        row_dict["__row_index"] = idx
         rows.append(row_dict)
 
+    plate_crop_dir = Path(lpr_cfg.get("plate_crop_dir") or input_path.parent / "plate_crops")
     worker_cfg = {
         "backend": lpr_cfg.get("backend", "onnxruntime-gpu"),
         "model_dir": lpr_cfg.get("model_dir") or None,
@@ -148,6 +220,7 @@ def enrich_events_csv_with_lpr(input_csv: str, output_csv: str | None, cfg: Dict
         "crop_margin": crop_margin,
         "input_field": input_field,
         "bbox_field": bbox_column,
+        "plate_crop_dir": str(plate_crop_dir),
     }
 
     max_workers = max(1, (os.cpu_count() or 4) - 1)
@@ -159,11 +232,13 @@ def enrich_events_csv_with_lpr(input_csv: str, output_csv: str | None, cfg: Dict
             plate_text = result.get("plate_text", "")
             plate_score = result.get("plate_score", 0.0)
             plate_bbox = result.get("plate_bbox", "")
+            plate_crop_path = result.get("plate_crop_path", "")
             status = result.get("lpr_status", "fail")
 
             df.at[idx, "plate_text"] = plate_text
             df.at[idx, "plate_score"] = plate_score
             df.at[idx, "plate_bbox"] = plate_bbox
+            df.at[idx, "plate_crop_path"] = plate_crop_path
             df.at[idx, "lpr_status"] = status
             status_counter[status] = status_counter.get(status, 0) + 1
 
